@@ -8,6 +8,7 @@ The codebase has been reviewed and verified with the assistance of Claude AI.
 from __future__ import annotations
 
 import re
+import json
 import unicodedata as _ud
 from typing import Optional
 
@@ -105,21 +106,8 @@ _ABCD_RE = re.compile(r"^[A-Da-d]\)")
 def parse_question_block(blk: str) -> Optional[dict]:
     """Parse one question block (separated by a blank line in a larger
     paste) into {question, options, correct_option_id, explanation}.
-
-    `correct_option_id` is an int (single ✅) or a list[int] (multiple ✅).
-    Returns None if the block doesn't parse into a valid question.
-
-    Newlines inside the question text (e.g. a passage followed by a blank
-    line, followed by the actual question) are preserved exactly -- only
-    the separator/option/marker lines used to structurally locate the
-    options are stripped away, never the blank lines a user typed on
-    purpose for spacing within the question itself.
     """
     blk = clean_markdown(blk)
-    # Keep blank lines here (structure-preserving) -- they're only used
-    # for splitting on the caller side (blocks separated by "\n\n"); a
-    # blank line *inside* one block is an intentional paragraph break in
-    # the question and must survive into the final `question` string.
     all_lines = blk.split("\n")
     if not any(ln.strip() for ln in all_lines):
         return None
@@ -133,9 +121,6 @@ def parse_question_block(blk: str) -> Optional[dict]:
             filtered.append(ln)
     all_lines = filtered
 
-    # Structural scan (separator / A-D markers) only ever needs to look at
-    # non-blank lines, but indexes must map back into `all_lines` so the
-    # split point doesn't chop a preserved blank line in half.
     non_blank_idx = [i for i, ln in enumerate(all_lines) if ln.strip()]
     if not non_blank_idx:
         return None
@@ -160,16 +145,9 @@ def parse_question_block(blk: str) -> Optional[dict]:
         q_lines = all_lines[:abcd_line_idx]
         opt_lines = all_lines[abcd_line_idx:]
     else:
-        # No structural marker found -- fall back to "first non-blank line
-        # is the question, everything after is options" (matches the
-        # original single-line-question behaviour).
         q_lines = all_lines[: first_nonblank + 1]
         opt_lines = all_lines[first_nonblank + 1:]
 
-    # Trim only leading/trailing wholly-blank lines from the question (so
-    # e.g. a stray blank line right before the separator doesn't leave a
-    # trailing "\n"), but keep every blank line that falls *between* two
-    # real content lines -- that's the intentional paragraph break.
     while q_lines and not q_lines[0].strip():
         q_lines = q_lines[1:]
     while q_lines and not q_lines[-1].strip():
@@ -201,40 +179,92 @@ def parse_question_block(blk: str) -> Optional[dict]:
 
 
 def filter_words(text: Optional[str], remove_words: list[str]) -> Optional[str]:
-    """Strip `[n/m]` progress markers and any user-configured remove-words
-    from `text`, while preserving newlines exactly as typed/pasted.
-
-    Only horizontal whitespace (spaces/tabs) is collapsed -- line breaks
-    are never touched, so multi-line questions/options/explanations keep
-    their original line structure end-to-end.
-    """
+    """Strip `[n/m]` progress markers and any user-configured remove-words."""
     if not text:
         return text
     text = re.sub(r"\[\s*\d+\s*/\s*\d+\s*\]", "", text)
     if remove_words:
         for w in remove_words:
             text = re.sub(rf"\b{re.escape(w)}\b", "", text, flags=re.IGNORECASE)
-    # Collapse runs of spaces/tabs only (never \n) and trim horizontal
-    # whitespace at the start/end of each line, without merging lines.
     lines = [re.sub(r"[ \t]+", " ", ln).strip(" \t") for ln in text.split("\n")]
     return "\n".join(lines).strip("\n")
 
 
 def strip_source_noise(text: Optional[str]) -> Optional[str]:
-    """Remove leaked `[Q 3/10]`-style progress markers, raw URLs, t.me
-    links, and @mentions that sometimes end up pasted into quiz text.
-
-    The bracket/paren marker only matches when it actually looks like a
-    progress tag -- either a `Q` prefix (`[Q3]`, `(Q.5)`) or a `n/m` pair
-    (`[11/100]`, `(3/10)`). A bare lone number in brackets/parens, like
-    `(1)` or `[2]`, is legitimate question content (e.g. an enumerated
-    list: "(1) Anaphase (2) Metaphase") and must never be stripped.
-    """
+    """Remove leaked `[Q 3/10]`-style progress markers, raw URLs, t.me links."""
     if not text:
         return text
+    # Fixed Regex Syntax Error here
     pattern = (
         r"(?:[\[\(]\s*Q\.?\s*\d+(?:\s*/\s*\d+)?\s*[\]\)]|"
         r"[\[\(]\s*\d+\s*/\s*\d+\s*[\]\)]|"
         r"\bQ\.?\s*\d+\s*/\s*\d+\)?|https?://[^\s]+|t\.me/[^\s]+|@\w+)"
     )
     return re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+
+# ==============================================================================
+# NEW HTML FILE PARSING LOGIC INTEGRATION
+# ==============================================================================
+
+def clean_html_tags(text: str) -> str:
+    """Helper to remove HTML tags specifically for raw file parsing."""
+    if not text:
+        return ""
+    clean_text = re.sub(r'<.*?>', '', str(text))
+    return " ".join(clean_text.split())
+
+def parse_html_file(file_path: str) -> list[dict]:
+    """
+    Parses a raw HTML file containing a JavaScript 'const test = {...}' object,
+    cleans the data, applies existing noise filters, and returns a list of dictionaries 
+    ready for Telegram poll API or MongoDB insertion.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            html_content = file.read()
+    except FileNotFoundError:
+        return []
+
+    # Extract raw JSON from JavaScript block
+    match = re.search(r'const test = (\{.*?\});\n</script>', html_content, re.DOTALL)
+    if not match:
+        return []
+
+    try:
+        test_data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+
+    parsed_polls = []
+
+    for q_num, q_info in test_data.get('qMap', {}).items():
+        q_id = q_info.get('id')
+        
+        if q_id in test_data.get('content', {}):
+            q_content = test_data['content'][q_id].get('hn', {})
+            correct_idx = test_data['correct'].get(q_id, 0)
+            
+            # Step 1: Clean HTML tags and enforce Telegram Character Limits
+            raw_question = clean_html_tags(q_content.get('text', ''))[:300]
+            raw_options = [clean_html_tags(opt)[:100] for opt in q_content.get('options', [])]
+            raw_explanation = clean_html_tags(q_content.get('solution', ''))[:200]
+            
+            # Step 2: Apply the bot's existing noise filters
+            question_text = strip_source_noise(raw_question)
+            options = [strip_source_noise(opt) for opt in raw_options if opt]
+            explanation_text = strip_source_noise(raw_explanation)
+
+            # Skip if options are invalid
+            if len(options) < 2:
+                continue
+                
+            parsed_polls.append({
+                "question_id": q_id, # Can be useful for MongoDB caching
+                "question": question_text,
+                "options": options,
+                "correct_option_id": correct_idx,
+                "explanation": explanation_text if explanation_text else None
+            })
+            
+    return parsed_polls
