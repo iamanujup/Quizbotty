@@ -320,9 +320,11 @@ async def handle_document(c: Client, m: Message) -> None:
         return
     if uid not in state.quiz_creation:
         return
-    allowed_types = ("text/plain", "application/json")
-    if m.document.mime_type not in allowed_types:
-        await m.reply("⚠️ Only .txt or .json files are supported for quiz questions.")
+    filename = (m.document.file_name or "").lower()
+    allowed_types = ("text/plain", "application/json", "text/html", "application/xhtml+xml")
+    is_supported_extension = filename.endswith((".txt", ".json", ".html", ".htm"))
+    if not is_supported_extension and m.document.mime_type not in allowed_types:
+        await m.reply("⚠️ Send a .txt, .json or supported .html quiz file.")
         return
 
     status = await m.reply("⏳ Processing...")
@@ -333,8 +335,13 @@ async def handle_document(c: Client, m: Message) -> None:
     user = await UserRepository(get_db()).get_or_create(uid)
     remove_words = user.get("remove_words", [])
 
+    upload_name = m.document.file_name or (
+        "upload.html" if m.document.mime_type in ("text/html", "application/xhtml+xml")
+        else "upload.json" if m.document.mime_type == "application/json"
+        else "upload.txt"
+    )
     count, error = process_uploaded_file(
-        content, m.document.file_name or "upload.txt", state.quiz_creation[uid]["questions"], remove_words
+        content, upload_name, state.quiz_creation[uid]["questions"], remove_words
     )
     if error:
         await status.edit_text(f"❌ Error: {error}")
