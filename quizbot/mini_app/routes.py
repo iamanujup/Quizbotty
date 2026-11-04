@@ -283,7 +283,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Quiz Player Mini App", docs_url=None, redoc_url=None)
     app.include_router(router)
 
-    @app.get("/")
+    @app.api_route("/", methods=["GET", "HEAD"])
     async def landing_page() -> FileResponse:
         # A bare visit to the Mini App's domain (no /play path) used to
         # fall through to FastAPI's default 404 handler and show a bare
