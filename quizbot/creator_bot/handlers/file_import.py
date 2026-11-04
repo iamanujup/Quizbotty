@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from html import unescape
+from html.parser import HTMLParser
 from typing import Optional
 
 from ..parsing import filter_words, parse_question_block, strip_source_noise
@@ -209,8 +211,9 @@ def _process_html(content: str, remove_words: list[str], out_questions: list[dic
 
     Supports the supplied Testbook-style export: qMap controls question order,
     content stores localized HTML, and correct maps question IDs to option indexes.
-    HTML markup is intentionally retained so image URLs, tables and formatting
-    in questions/solutions survive into the Mini App rich renderer.
+    HTML is converted to readable plain text because Telegram quiz polls do not
+    render arbitrary HTML markup. Character references such as &nbsp; and &#39;
+    are decoded before the question and options are saved.
     """
     data = _extract_js_object(content, "test")
     qmap = data.get("qMap")
@@ -225,13 +228,46 @@ def _process_html(content: str, remove_words: list[str], out_questions: list[dic
     processed = 0
     section_data = data.get("sections") or {}
 
+    class _QuizTextParser(HTMLParser):
+        """Convert HTML fragments into readable plain text for Telegram polls."""
+
+        BLOCK_TAGS = {
+            "p", "div", "br", "li", "ul", "ol", "tr", "table",
+            "section", "article", "blockquote", "h1", "h2", "h3",
+            "h4", "h5", "h6",
+        }
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts: list[str] = []
+
+        def handle_data(self, data: str) -> None:
+            self.parts.append(data)
+
+        def handle_starttag(self, tag: str, attrs) -> None:
+            if tag in self.BLOCK_TAGS:
+                self.parts.append("\n")
+            elif tag == "img":
+                alt = dict(attrs).get("alt", "")
+                if alt:
+                    self.parts.append(alt)
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in self.BLOCK_TAGS:
+                self.parts.append("\n")
+
     def clean_html(value):
         if value is None:
             return ""
-        value = str(value)
-        # Preserve markup, but apply configured word filters to visible text only
-        # would require rewriting HTML nodes; avoid corrupting tags/attributes.
-        return value
+        parser = _QuizTextParser()
+        parser.feed(str(value))
+        parser.close()
+        text = unescape("".join(parser.parts))
+        text = text.replace("\xa0", " ").replace("\u200b", "")
+        text = re.sub(r"[ \t\r]+", " ", text)
+        text = re.sub(r" *\n *", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     for qnum, mapping in sorted(qmap.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**9):
         try:
@@ -264,7 +300,16 @@ def _process_html(content: str, remove_words: list[str], out_questions: list[dic
             options = [clean_html(option) for option in options]
             passage = clean_html(item.get("passage"))
             if passage:
-                question = passage + question
+                question = passage + "\n" + question
+            if remove_words:
+                question = filter_words(question, remove_words)
+                options = [filter_words(option, remove_words) for option in options]
+                if solution:
+                    solution = filter_words(solution, remove_words)
+            question = strip_source_noise(question)
+            options = [strip_source_noise(option) for option in options]
+            if solution:
+                solution = strip_source_noise(solution)
             section_key = str(mapping.get("section", ""))
             section = section_data.get(section_key, {}) if isinstance(section_data, dict) else {}
             out_questions.append({
