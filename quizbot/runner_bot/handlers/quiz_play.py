@@ -58,6 +58,41 @@ from ..telegram_utils import (
 
 logger = logging.getLogger(__name__)
 
+
+async def _force_subscribed(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Check whether a private-chat user joined the required public channel."""
+    channel = (config.REQUIRED_SUB_CHANNEL or "MOCKMARG").strip()
+    if not channel:
+        return True
+    if not channel.startswith("@") and not channel.lstrip("-").isdigit():
+        channel = "@" + channel
+    member = await ctx.bot.get_chat_member(chat_id=channel, user_id=user_id)
+    status = str(member.status).lower()
+    if status in ("member", "administrator", "creator", "owner"):
+        return True
+    return status == "restricted" and bool(getattr(member, "is_member", False))
+
+
+async def _send_force_sub_prompt(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, payload: str = "home"
+) -> None:
+    """Show join + retry buttons; retry reopens the same /start payload."""
+    channel = (config.REQUIRED_SUB_CHANNEL or "MOCKMARG").strip().lstrip("@")
+    retry_url = f"https://t.me/MOCKMARGBOT?start={payload or 'home'}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 JOIN CHANNEL", url=f"https://t.me/{channel}")],
+        [InlineKeyboardButton("🔄 RETRY / VERIFY", url=retry_url)],
+    ])
+    await safe_send_message(
+        ctx, chat_id,
+        "🔒 <b>MOCKS MARG — Join Required</b>\n\n"
+        "Quiz शुरू करने से पहले हमारे Telegram चैनल को जॉइन करें।\n\n"
+        "1. JOIN CHANNEL दबाकर चैनल जॉइन करें।\n"
+        "2. वापस आकर RETRY / VERIFY दबाएँ।\n\n"
+        "सदस्यता सफलतापूर्वक जाँचने के बाद आपका वही Quiz खुलेगा।",
+        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+    )
+
 _ANON_ADMIN_ID = 1087968824  # Telegram's fake @GroupAnonymousBot user id.
 
 # How often (every N questions) to auto-post a mid-quiz leaderboard. 0 disables it.
@@ -1241,6 +1276,20 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         user_id = update.message.from_user.id
 
+        # Enforce channel membership for every private /start entry, including
+        # personal quiz deep-links. Keep the original payload so Retry reopens
+        # the exact same quiz (rather than sending the user to a generic start).
+        if chat_type == ChatType.PRIVATE:
+            start_payload = ctx.args[0] if ctx.args else "home"
+            try:
+                if not await _force_subscribed(ctx, user_id):
+                    await _send_force_sub_prompt(ctx, chat_id, start_payload)
+                    return
+            except Exception as sub_exc:
+                logger.warning("Force-subscription check failed for user %s: %s", user_id, sub_exc)
+                await _send_force_sub_prompt(ctx, chat_id, start_payload)
+                return
+
         if not await is_premium_user(user_id):
             await safe_send_message(ctx, chat_id, "Please help us to make this project more valuable by purchasing premium! Thanks")
             return
@@ -1248,7 +1297,7 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_send_message(ctx, chat_id, "⏱️ Too many requests. Wait a moment.")
             return
 
-        if not ctx.args:
+        if not ctx.args or ctx.args[0] == "home":
             welcome = (
                 "\U0001F44B Welcome to <b>Advance Quiz Bot</b>!\n\n"
                 "Create quizzes with MCQs, sections, timers, and more.\n\n"
