@@ -1,1232 +1,1721 @@
-import asyncio
-import html
-import json
-import os
-from urllib.parse import quote
-
-from telegram import InlineKeyboardButton as Btn
-from telegram import InlineKeyboardMarkup as Markup
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-
-def _load_env(path=".env"):
-    """Chhota .env reader (koi extra library nahi). Format: KEY=value"""
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
-    if not os.path.exists(p):
-        return
-    with open(p, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
-_load_env()
-
-# ====== SETTINGS ======
-BOT_TOKEN = os.environ.get("BOT_TOKEN") or "8645794008:AAF_Ity4wGbBxC21DD83p-NSUhyn2DLX6T0"  # .env me BOT_TOKEN=... likho (ya yaha seedha paste karo)
-ADMIN_ID = int(os.environ.get("OWNER_ID") or 8904892914)  # owner ka Telegram user ID (bot me /id bhejke pata karo)
-CHANNEL = "@SADHNAAMARG"  # force-join channel (bot ko channel me ADMIN banao)
-FREE_TESTS = 5
-REFER_BONUS = 10
-BOT_LINK = "https://t.me/SADHNAAMARG"  # HTML ke JOIN CHANNEL button ka link
-BOT_START_LINK = "https://t.me/MOCKMARGJUBOT"  # bot ka public link
-BRAND = "MOCK MARG"  # HTML design me dikhne wala naam
-PHOTO_URL = "https://i.ibb.co/JwKwhmrK/premanand.jpg"  # splash photo ("" = sirf emoji)
-AUDIO_URL = "https://www.image2url.com/r2/default/audio/1790389409501-6f5e0c57-e05f-4e6f-99b1-6a81a57cbcfc.m4a"  # "" = audio band
-MAKE_PDF = True  # HTML ke saath PDF bhi banao (pip install weasyprint)
-SECTION_NAMES = []  # jaise ["Reasoning", "GK", "Maths", "Hindi"]; khali = Section 1, 2, ...
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(BASE_DIR, "data.json")
-USERS_FILE = os.path.join(BASE_DIR, "users.json")
-# ======================
-# Data: [ {"title": coaching, "sections": [ {"title": section, "subs": [
-#          {"title": subsection, "files": [{"file_id"/"path": ..., "name": ...}]} ]} ]} ]
-
-ADMIN_ONLY = ("addc", "addsec", "addsub", "addf", "dc", "dsec", "dsub", "rnc", "rnsec", "rnsub")
-HTML = ParseMode.HTML
-h = html.escape
-
-
-def make_caption(name):
-    """Test file ka caption (sab BOLD, HTML parse mode)."""
-    return (
-        f"➥🌸 <b>{h(name)}</b>🌸\n\n"
-        "<b>@SADHNAAMARG</b>\n"
-        "🤖 <a href=\"https://t.me/MOCKMARGJUBOT\">BOT START</a>\n"
-        "<b>══━━━━━━━✧❂✧━━━━━━━══</b>\n"
-        "<b>share जरूर करें ‼️...</b>"
-    )
-
-
-def _stem_title(name):
-    base = os.path.splitext(name or "test")[0]
-    for suf in ("_MockMarg_PRINT", "_MockMarg"):
-        if base.endswith(suf):
-            base = base[: -len(suf)]
-    return base
-
-
-# ---------- Storage ----------
-def load():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
-
-def save(items):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
-
-
-def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def save_users(users):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, indent=2)
-
-
-def get_user(users, uid):
-    return users.setdefault(
-        str(uid),
-        {"used": 0, "bonus": 0, "ref_by": None, "credited": False, "invited": 0},
-    )
-
-
-def remaining(rec):
-    return FREE_TESTS + rec["bonus"] - rec["used"]
-
-
-def grid(buttons, cols=2):
-    return [buttons[i : i + cols] for i in range(0, len(buttons), cols)]
-
-
-async def edit(q, text, kb=None):
-    try:
-        await q.edit_message_text(text, reply_markup=kb, parse_mode=HTML)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
-
-
-
-# ======================================================================
-#  MOCK MARG converter  (kisi bhi test HTML ko PET Mock design me badalta hai)
-# ======================================================================
-import base64
-import io
-import re
-import zlib
-
-DEFAULT_PHOTO = "https://i.ibb.co/JwKwhmrK/premanand.jpg"
-DEFAULT_AUDIO = (
-    "https://www.image2url.com/r2/default/audio/"
-    "1790389409501-6f5e0c57-e05f-4e6f-99b1-6a81a57cbcfc.m4a"
-)
-
-# ---------------------------------------------------------------- helpers
-def js_str(value):
-    """Python string -> safe JS string literal (inside <script>)."""
-    return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
-
-
-def extract_json(text, start_marker, open_ch, close_ch):
-    """Marker ke baad wala balanced JSON (array/object) nikalta hai."""
-    i = text.find(start_marker)
-    if i < 0:
-        return None
-    i = text.find(open_ch, i)
-    depth, in_str, esc = 0, False, False
-    for j in range(i, len(text)):
-        c = text[j]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        else:
-            if c == '"':
-                in_str = True
-            elif c == open_ch:
-                depth += 1
-            elif c == close_ch:
-                depth -= 1
-                if depth == 0:
-                    return json.loads(text[i : j + 1])
-    raise ValueError("JSON poora nahi mila")
-
-
-_STYLE_TAG = re.compile(r"<style\b[^>]*>.*?</style>", re.S | re.I)
-_BAD_CSS = re.compile(
-    r"(?:font-family|font-size|margin(?:-top|-bottom|-left|-right)?|line-height)\s*:[^;\"']*;?",
-    re.I,
-)
-_EMPTY_STYLE = re.compile(r'\sstyle\s*=\s*(?:"\s*"|\'\s*\')', re.I)
-
-
-def clean(fragment):
-    """appx HTML se KOKILA font / extra margin hata deta hai taaki PET design ka font lage."""
-    if not fragment:
-        return ""
-    s = _STYLE_TAG.sub("", fragment)
-
-    def fix_style(m):
-        return m.group(1) + _BAD_CSS.sub("", m.group(2)) + m.group(3)
-
-    s = re.sub(r'(style\s*=\s*")([^"]*)(")', fix_style, s, flags=re.I)
-    s = _EMPTY_STYLE.sub("", s)
-    return s.strip()
-
-
-def img(url):
-    return f'<img src="{html.escape(url, quote=True)}" style="max-width:100%">' if url else ""
-
-
-# ---------------------------------------------------------------- appx -> test
-def build_test_from_appx(questions, title, total_seconds, section_names):
-    test = {
-        "title": title,
-        "testTitle": title,
-        "questions": len(questions),
-        "marks": 0,
-        "timer": total_seconds,
-        "timeSpent": 0,
-        "current": 1,
-        "answers": {},
-        "correct": {},
-        "questionMarks": {},
-        "qMap": {},
-        "sections": {},
-        "currentSection": "all",
-        "submitted": False,
-        "content": {},
-        "languages": [
-            {"code": "en", "label": "English", "api_name": "English", "aliases": ["en", "english"]},
-            {"code": "hn", "label": "Hindi", "api_name": "Hindi", "aliases": ["hn", "hi", "hindi"]},
-        ],
-        "currentLanguage": "hn",
-    }
-
-    sec_order = []
-    for q in questions:
-        if q["section_id"] not in sec_order:
-            sec_order.append(q["section_id"])
-    names = [n.strip() for n in (section_names or []) if n.strip()]
-    sec_key = {sid: str(i) for i, sid in enumerate(sec_order)}
-    for sid, key in sec_key.items():
-        idx = int(key)
-        name = names[idx] if idx < len(names) else (
-            f"Section {idx + 1}" if len(sec_order) > 1 else "Full Test"
-        )
-        test["sections"][key] = {"name": name, "start_question": 0, "questions": []}
-
-    total = 0.0
-    for n, q in enumerate(questions, start=1):
-        qid = str(q["id"])
-        key = sec_key[q["section_id"]]
-        sec = test["sections"][key]
-        if not sec["questions"]:
-            sec["start_question"] = n
-        sec["questions"].append(n)
-        test["qMap"][str(n)] = {"id": qid, "section": key}
-
-        pos = float(q.get("positive_marks") or 0)
-        neg = float(q.get("negative_marks") or 0)
-        pos = int(pos) if pos == int(pos) else pos
-        test["questionMarks"][qid] = {"positive": pos, "negative": neg}
-        total += pos
-
-        options = []
-        for i in range(1, 11):
-            o = clean(q.get(f"option_{i}", "")) or img(q.get(f"option_image_{i}", ""))
-            if o:
-                options.append(o)
-        ans = int(q.get("answer") or 1) - 1
-        test["correct"][qid] = max(0, min(ans, max(len(options) - 1, 0)))
-
-        text = clean(q.get("question", ""))
-        for k in (1, 2, 3):
-            text += img(q.get(f"image_link_{k}", ""))
-        solution = clean(q.get("solution_text", ""))
-        solution += img(q.get("solution_image_1", "")) + img(q.get("solution_image_2", ""))
-        test["content"][qid] = {
-            "hn": {
-                "text": text,
-                "passage": clean(q.get("directive", "")) or clean(q.get("question_heading", "")),
-                "options": options,
-                "solution": solution,
-            }
-        }
-    test["marks"] = int(total) if total == int(total) else total
-    return test
-
-
-
-def convert_html(raw, filename="test.html"):
-    """Raw HTML text -> (MOCK MARG design wali HTML text, test dict)."""
-    m = re.search(r"<title>(.*?)</title>", raw, re.S | re.I)
-    title = html.unescape(m.group(1)).strip() if m else os.path.splitext(filename)[0]
-
-    test = extract_json(raw, "const test =", "{", "}")
-    if test is None:
-        questions = extract_json(raw, "const questions =", "[", "]")
-        if questions is None:
-            raise ValueError("`const questions` ya `const test` nahi mila - ye HTML format support nahi hai")
-        tm = re.search(r"const totalTime\s*=\s*(\d+)\s*\*\s*60", raw)
-        seconds = int(tm.group(1)) * 60 if tm else 120 * 60
-        test = build_test_from_appx(questions, title, seconds, SECTION_NAMES)
-    else:  # PET style HTML: sirf re-brand
-        test["title"] = test.get("title") or title
-        test["testTitle"] = test["title"]
-
-    page = zlib.decompress(base64.b64decode(_TEMPLATE_B64)).decode("utf-8")
-    repl = {
-        "{{BRAND_JS}}": js_str(BRAND),
-        "{{BOT_LINK_JS}}": js_str(BOT_LINK),
-        "{{PHOTO_JS}}": js_str(PHOTO_URL),
-        "{{AUDIO_JS}}": js_str(AUDIO_URL),
-        "{{TITLE}}": html.escape(test["title"]),
-        "{{BRAND}}": html.escape(BRAND),
-        "{{BOT_LINK}}": html.escape(BOT_LINK, quote=True),
-        "{{PHOTO}}": html.escape(PHOTO_URL, quote=True),
-    }
-    for k, v in repl.items():
-        page = page.replace(k, v)
-    page = page.replace("/*__TEST_JSON__*/null", json.dumps(test, ensure_ascii=False).replace("</", "<\\/"))
-    return page, test
-
-
-
-# ======================================================================
-#  PDF maker  (test -> MOCK MARG PDF: cover + questions + answer key + solutions)
-# ======================================================================
-def _pick(test, qid):
-    c = (test.get("content") or {}).get(qid) or {}
-    for lang in ("hn", "en"):
-        d = c.get(lang) or {}
-        if d.get("text") or d.get("options"):
-            return d
-    return {"text": "", "options": [], "solution": "", "passage": ""}
-
-
-PDF_CSS = """
-@page { size: A4; margin: 15mm 13mm; }
-* { box-sizing: border-box; }
-body { font-family: 'Noto Sans Devanagari','Mangal','Lohit Devanagari','Nirmala UI',Arial,sans-serif;
-       font-size: 10.5pt; line-height: 1.55; color: #3e2723; margin: 0; }
-img { max-width: 100%; height: auto; }
-p { margin: 0 0 4pt; }
-.cover { text-align: center; padding-top: 62mm; page-break-after: always; }
-.cover .brand { font-size: 44pt; font-weight: 800; color: #7b241c; letter-spacing: 2pt; }
-.cover .line { width: 90mm; height: 3pt; background: #d4a017; margin: 8mm auto; }
-.cover .title { font-size: 20pt; font-weight: 700; color: #c0392b; margin: 0 12mm 10mm; }
-.cover .stats { font-size: 13pt; color: #5d4037; margin-bottom: 14mm; }
-.cover .stats b { color: #7b241c; }
-.cover .link { font-size: 13pt; color: #e67e22; font-weight: 700; }
-.sec { background: #7b241c; color: #fff; padding: 5pt 10pt; font-weight: 700; font-size: 12pt;
-       margin: 10pt 0 8pt; border-radius: 4pt; page-break-after: avoid; }
-.q { page-break-inside: avoid; margin: 0 0 9pt; padding-bottom: 6pt; border-bottom: 1px solid #f0e6d3; }
-.qn { font-weight: 800; color: #c0392b; }
-.passage { background: #fdf6e3; padding: 5pt 8pt; margin-bottom: 4pt; border-left: 3pt solid #d4a017; }
-.opt { margin: 2pt 0 2pt 16pt; }
-.opt b { color: #7b241c; }
-.opt p { display: inline; margin: 0; }
-.qline p:first-of-type { display: inline; }
-.sol p:first-of-type { display: inline; }
-h2 { color: #7b241c; font-size: 16pt; border-bottom: 2pt solid #d4a017; padding-bottom: 3pt; margin: 0 0 8pt; }
-.newpage { page-break-before: always; }
-table.key { border-collapse: collapse; width: 100%; }
-table.key td { border: 1px solid #e6d3a3; padding: 3pt 4pt; text-align: center; font-size: 10pt; }
-table.key td.n { background: #fdf6e3; font-weight: 700; color: #7b241c; }
-.sol { page-break-inside: avoid; margin: 0 0 8pt; padding-bottom: 5pt; border-bottom: 1px solid #f0e6d3; }
-.sol .ans { color: #2e7d32; font-weight: 800; }
-.foot { text-align: center; color: #8d6e63; font-size: 9pt; margin-top: 12pt; }
+"""
+Advance Quiz Bot — Open Source Project
+This project was originally developed by Gagan (github.com/devgaganin).
+Reference: https://t.me/advance_quiz_bot
+The codebase has been reviewed and verified with the assistance of Claude AI.
 """
 
+from __future__ import annotations
 
-def build_pdf_html(test, auto_print=False):
-    e = html.escape
-    letters = "ABCDEFGHIJ"
-    secs = test.get("sections") or {}
-    qmap = test.get("qMap") or {}
-    order = sorted(secs, key=lambda k: secs[k].get("start_question", 0))
-    marks = test.get("marks", "")
-    mins = int(test.get("timer", 0)) // 60
-    out = [
-        "<!DOCTYPE html><html lang='hi'><head><meta charset='utf-8'>",
-        "<link href='https://fonts.googleapis.com/css2?family=Noto+Sans+Devanagari:wght@400;700;800&display=swap' rel='stylesheet'>",
-        f"<title>{e(test['title'])}</title><style>{PDF_CSS}</style></head><body>",
-        "<div class='cover'>",
-        f"<div class='brand'>{e(BRAND)}</div><div class='line'></div>",
-        f"<div class='title'>{e(test['title'])}</div>",
-        f"<div class='stats'><b>{test.get('questions', 0)}</b> प्रश्न &nbsp;•&nbsp; <b>{e(str(marks))}</b> अंक &nbsp;•&nbsp; <b>{mins}</b> मिनट</div>",
-        f"<div class='link'>{e(BOT_LINK)}</div></div>",
-    ]
-    answers = []  # (n, letter, solution)
-    for k in order:
-        if len(order) > 1:
-            out.append(f"<div class='sec'>{e(secs[k].get('name', ''))}</div>")
-        for n in secs[k].get("questions", []):
-            qid = (qmap.get(str(n)) or {}).get("id")
-            if not qid:
-                continue
-            c = _pick(test, qid)
-            out.append(f"<div class='q'><div class='qline'><span class='qn'>Q{n}.</span> ")
-            if c.get("passage"):
-                out.append(f"<div class='passage'>{c['passage']}</div>")
-            out.append(f"{c.get('text', '')}</div>")
-            for i, o in enumerate(c.get("options", [])):
-                out.append(f"<div class='opt'><b>({letters[i]})</b> {o}</div>")
-            out.append("</div>")
-            ci = (test.get("correct") or {}).get(qid, 0)
-            answers.append((n, letters[ci] if 0 <= ci < len(letters) else "?", c.get("solution", "")))
-    out.append("<div class='newpage'><h2>उत्तर कुंजी (Answer Key)</h2><table class='key'>")
-    per_row = 8
-    for r in range(0, len(answers), per_row):
-        row = answers[r : r + per_row]
-        out.append("<tr>" + "".join(f"<td class='n'>{n}</td><td>{a}</td>" for n, a, _ in row)
-                   + "<td></td><td></td>" * (per_row - len(row)) + "</tr>")
-    out.append("</table></div>")
-    if any(sol for _, _, sol in answers):
-        out.append("<div class='newpage'><h2>हल (Solutions)</h2>")
-        for n, a, sol in answers:
-            if sol:
-                out.append(f"<div class='sol'><span class='qn'>Q{n}.</span> <span class='ans'>उत्तर: ({a})</span>{sol}</div>")
-        out.append("</div>")
-    out.append(f"<div class='foot'>{e(BRAND)} • {e(BOT_LINK)}</div>")
-    if auto_print:  # browser me khulte hi Print dialog -> "Save as PDF"
-        out.append("<script>window.onload=function(){setTimeout(function(){window.print()},1500)}</script>")
-    out.append("</body></html>")
-    return "".join(out)
+import asyncio
+import base64
+import logging
+import os
+import tempfile
+import time
+from typing import Any, Optional
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Poll, Update
+from telegram.constants import ChatType, ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes, PollAnswerHandler
 
-class NoPdfEngine(Exception):
-    pass
+from quizbot.database import (
+    AttemptRepository,
+    LeaderboardRepository,
+    MistakeRepository,
+    QuestionStatsRepository,
+    QuizRepository,
+    get_db,
+)
+from quizbot.shared import config
+from quizbot.shared.html.quiz_report import render_quiz_html
+from quizbot.shared.mini_app_link import mini_app_web_app_button_ptb
+from quizbot.shared.rich_quiz import (
+    RichDispatchResult,
+    _is_rich,
+    _normalise_math_spacing,
+    enrich_question_dispatch,
+    send_rich_or_fallback,
+)
+from quizbot.shared.utils import is_premium_user
 
-
-def html_to_pdf(page_html):
-    """WeasyPrint (pip install weasyprint) ya Playwright/Chromium. Dono na ho (jaise Pydroid) to NoPdfEngine."""
-    try:
-        from weasyprint import HTML as WeasyHTML
-
-        return WeasyHTML(string=page_html).write_pdf()
-    except (ImportError, OSError):
-        pass
-    try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            page = browser.new_page()
-            page.set_content(page_html, wait_until="load", timeout=90000)
-            pdf = page.pdf(format="A4", print_background=True)
-            browser.close()
-            return pdf
-    except Exception as e:
-        raise NoPdfEngine(str(e)) from e
-
-
-def test_to_pdf(test):
-    return html_to_pdf(build_pdf_html(test))
-
-
-async def make_test_file(context, chat_id, doc):
-    """Uploaded HTML -> MOCK MARG HTML (+ PDF). (files_list, note) lautata hai."""
-    tg_file = await doc.get_file()
-    raw = bytes(await tg_file.download_as_bytearray()).decode("utf-8", errors="replace")
-    stem = os.path.splitext(doc.file_name or "test")[0]
-    try:
-        page, test = await asyncio.to_thread(convert_html, raw, doc.file_name or "test.html")
-    except Exception as e:  # convert nahi hua -> original save
-        return (
-            [{"file_id": doc.file_id, "name": doc.file_name}],
-            f"⚠️ Convert nahi hua ({h(str(e))[:150]}). Original file save ki.",
-        )
-    name = f"{stem}_MockMarg.html"
-    sent = await context.bot.send_document(
-        chat_id,
-        page.encode("utf-8"),
-        filename=name,
-        caption=make_caption(test["title"]),
-        parse_mode=HTML,
-    )
-    files = [{"file_id": sent.document.file_id, "name": name, "title": test["title"]}]
-    note = f"🎨 {BRAND} HTML ready ({test['questions']} Q)."
-    if MAKE_PDF:
-        try:
-            pdf = await asyncio.to_thread(test_to_pdf, test)
-            pname = f"{stem}_MockMarg.pdf"
-            psent = await context.bot.send_document(
-                chat_id, pdf, filename=pname, caption=make_caption(test["title"]), parse_mode=HTML
-            )
-            files.append({"file_id": psent.document.file_id, "name": pname, "title": test["title"]})
-            note += "\n📕 PDF bhi ban gayi."
-        except Exception:
-            # Is device par PDF engine nahi (Pydroid) -> print-ready HTML bhejo
-            ph = build_pdf_html(test, auto_print=True)
-            await context.bot.send_document(
-                chat_id,
-                ph.encode("utf-8"),
-                filename=f"{stem}_MockMarg_PRINT.html",
-                caption="🖨 PDF ke liye: is file ko Chrome me kholo → Print → Save as PDF. "
-                "Phir wo PDF yaha bhej do, subsection me add ho jayegi.",
-            )
-            note += "\n🖨 PDF yaha auto nahi bani — Print wali HTML bhej di (Chrome → Save as PDF)."
-    return files, note
-
-
-# ======================================================================
-#  Template (PET Mock design, compressed)
-# ======================================================================
-_TEMPLATE_B64 = (
-    "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"
-    "H6PSXA=="
+from ..pdf_reports import render_quiz_pdf
+from ..quiz_utils import (
+    get_section_for_question,
+    is_correct,
+    resolve_quiz_access,
+    section_marks,
+    shuffle_options_multi,
+)
+from ..state import channel_poll_tasks, rate_limiter, session_mgr, tasks, translation_mgr
+from ..telegram_utils import (
+    _get_topic_thread_id,
+    prepare_poll_data,
+    safe_send_message,
+    safe_send_poll,
+    send_raw_api,
 )
 
-# ---------- Channel + referral ----------
-async def is_member(bot, uid):
+logger = logging.getLogger(__name__)
+
+
+async def _force_subscribed(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Check whether a private-chat user joined the required public channel."""
+    channel = (config.REQUIRED_SUB_CHANNEL or "SADHNAAMARG").strip()
+    if not channel:
+        return True
+    if not channel.startswith("@") and not channel.lstrip("-").isdigit():
+        channel = "@" + channel
+    member = await ctx.bot.get_chat_member(chat_id=channel, user_id=user_id)
+    status = str(member.status).lower()
+    if status in ("member", "administrator", "creator", "owner"):
+        return True
+    return status == "restricted" and bool(getattr(member, "is_member", False))
+
+
+async def _send_force_sub_prompt(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, payload: str = "home"
+) -> None:
+    """Show join + retry buttons; retry reopens the same /start payload."""
+    channel = (config.REQUIRED_SUB_CHANNEL or "SADHNAAMARG").strip().lstrip("@")
+    retry_url = f"https://t.me/MOCKMARGJUBOT?start={payload or 'home'}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 JOIN CHANNEL", url=f"https://t.me/{channel}")],
+        [InlineKeyboardButton("🔄 RETRY / VERIFY", url=retry_url)],
+    ])
+    await safe_send_message(
+        ctx, chat_id,
+        "🔒 <b>MOCKS MARG — Join Required</b>\n\n"
+        "Quiz शुरू करने से पहले हमारे Telegram चैनल को जॉइन करें।\n\n"
+        "1. JOIN CHANNEL दबाकर चैनल जॉइन करें।\n"
+        "2. वापस आकर RETRY / VERIFY दबाएँ।\n\n"
+        "सदस्यता सफलतापूर्वक जाँचने के बाद आपका वही Quiz खुलेगा।",
+        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+    )
+
+_ANON_ADMIN_ID = 1087968824  # Telegram's fake @GroupAnonymousBot user id.
+
+# How often (every N questions) to auto-post a mid-quiz leaderboard. 0 disables it.
+MID_QUIZ_LB_INTERVAL = 10
+
+# Anti-cheat pattern-detection tuning (not part of shared config -- specific
+# to this handler's group-quiz cheat check, separate from CHEAT_SPEED_THRESHOLD).
+CHEAT_CHECK_EVERY = 10
+CHEAT_WRONG_RATIO = 0.5
+
+
+def _is_anon_admin(message) -> bool:
+    return message.sender_chat is not None or (
+        message.from_user is not None and message.from_user.id == _ANON_ADMIN_ID
+    )
+
+
+async def _require_admin(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: Optional[int], is_anon: bool) -> bool:
+    """Return True if the caller may run admin-only quiz-control commands."""
+    if is_anon:
+        return True  # Telegram only delivers anonymous-admin commands from actual admins.
     try:
-        m = await bot.get_chat_member(CHANNEL, uid)
-        return m.status in ("member", "administrator", "creator", "restricted")
-    except Exception as e:
-        print("Channel check fail (bot channel me admin hai?):", e)
+        member = await ctx.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
         return False
 
 
-async def credit_referral(context, uid):
-    users = load_users()
-    rec = users.get(str(uid))
-    if not rec or not rec.get("ref_by") or rec.get("credited"):
+async def translate_text(text: str, target_lang: str) -> str:
+    """Translate text via deep-translator (lazy import). Falls back to the
+    original text on any failure so translation is never fatal to a quiz."""
+    try:
+        from deep_translator import GoogleTranslator
+    except ImportError:
+        logger.warning("deep_translator not installed; translation skipped")
+        return text
+    if not text or not text.strip():
+        return text
+    try:
+        max_len = 5000
+        if len(text) <= max_len:
+            return GoogleTranslator(source="auto", target=target_lang).translate(text)
+        parts, current = [], ""
+        for para in text.split("\n"):
+            if len(current) + len(para) + 1 <= max_len:
+                current = f"{current}\n{para}" if current else para
+            else:
+                if current:
+                    parts.append(current)
+                current = para
+        if current:
+            parts.append(current)
+        translated = [
+            GoogleTranslator(source="auto", target=target_lang).translate(p) for p in parts if p.strip()
+        ]
+        return "\n".join(translated)
+    except Exception as e:
+        logger.error("Translation error: %s", e)
+        return text
+
+
+async def translate_question(qdata: dict, target_lang: str) -> dict:
+    t = qdata.copy()
+    try:
+        if "question" in qdata:
+            t["question"] = await translate_text(qdata["question"], target_lang)
+        if isinstance(qdata.get("options"), list):
+            t["options"] = [await translate_text(o, target_lang) for o in qdata["options"]]
+        if qdata.get("reply_text"):
+            t["reply_text"] = await translate_text(qdata["reply_text"], target_lang)
+        if qdata.get("explanation"):
+            t["explanation"] = await translate_text(qdata["explanation"], target_lang)
+    except Exception as e:
+        logger.error("translate_question error: %s", e)
+        return qdata
+    return t
+
+
+async def wait_until_resumed(chat_id: int) -> None:
+    while True:
+        s = session_mgr.get(chat_id)
+        if not s or not s.get("paused"):
+            return
+        await asyncio.sleep(1.5)
+
+
+def _apply_char_boost(q: dict, timer: int) -> int:
+    """Long questions get a little extra reading time when the timer is
+    already short: >600 chars -> +30s, >450 chars -> +20s."""
+    total_chars = len(q.get("question", ""))
+    for opt in q.get("options", []):
+        total_chars += len(opt)
+    total_chars += len(q.get("reply_text") or "")
+    if timer < 30:
+        if total_chars > 600:
+            timer += 30
+        elif total_chars > 450:
+            timer += 20
+    return timer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PRIVATE (DM) QUIZ
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def start_private_quiz(
+    chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, questions: list[dict], quiz: dict, qid: str, skip: int = 0
+) -> None:
+    """Begin a one-on-one DM quiz session."""
+    try:
+        data = {
+            "quiz_id": qid, "current_index": skip, "paused": False,
+            "questions": questions, "quiz_data": quiz, "is_private": True,
+            "participants": {chat_id: {"name": "You", "answers": {}, "start_time": time.time()}},
+            "waiting_for_answer": False, "active_poll_id": None,
+            "polls": {}, "section_msgs": [], "current_section": None,
+            "sections": quiz.get("sections", []), "context": ctx,
+            "modified_timer_offset": 0,
+        }
+        await session_mgr.create(chat_id, data)
+
+        sections = quiz.get("sections", [])
+        if sections:
+            sections.sort(key=lambda s: s["question_range"][0])
+            start_sec = next((sec for sec in sections if skip < sec["question_range"][1]), None)
+            if start_sec:
+                await _private_section_start(chat_id, start_sec, skip)
+            else:
+                await safe_send_message(ctx, chat_id, "⚠️ Skip count beyond all sections.")
+                await session_mgr.delete(chat_id)
+        else:
+            await send_private_question(chat_id, ctx, skip)
+    except Exception as e:
+        logger.error("start_private_quiz error: %s", e, exc_info=True)
+        await safe_send_message(ctx, chat_id, "❌ Error starting quiz.")
+        await session_mgr.delete(chat_id)
+
+
+async def _private_section_start(chat_id: int, section: dict, skip: int = 0) -> None:
+    s = session_mgr.get(chat_id)
+    if not s or s.get("paused"):
         return
-    rec["credited"] = True
-    ref = users.get(str(rec["ref_by"]))
-    if ref:
-        ref["bonus"] += REFER_BONUS
-        ref["invited"] += 1
-    save_users(users)
-    if ref:
-        try:
-            await context.bot.send_message(
-                rec["ref_by"],
-                f"🎉 <b>Tumhare refer se ek dost ne join kiya!</b>\n+{REFER_BONUS} tests mil gaye.",
-                parse_mode=HTML,
+    start_idx, end_idx = section["question_range"]
+    name = section.get("name", f"Section {start_idx}-{end_idx}")
+    timer = section.get("timer", s["quiz_data"]["timer"])
+    ctx = s["context"]
+    msg = await safe_send_message(
+        ctx, chat_id,
+        f"\U0001F4DA <b>{name}</b> started\n⏱️ Timer: {timer}s\n\U0001F4CB Q{start_idx}–{end_idx}",
+        parse_mode=ParseMode.HTML,
+    )
+    if msg:
+        s["section_msgs"].append(msg.message_id)
+        s["current_section"] = section
+        s["current_section_timer"] = timer
+        await session_mgr.update(chat_id, s)
+        first = max(skip, start_idx - 1)
+        await send_private_question(chat_id, ctx, first)
+
+
+async def send_private_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, idx: int) -> None:
+    try:
+        s = session_mgr.get(chat_id)
+        if not s:
+            return
+        await wait_until_resumed(chat_id)
+
+        questions = s["questions"]
+        if idx >= len(questions):
+            await end_private_quiz(chat_id, ctx)
+            return
+
+        cur_section = s.get("current_section")
+        if cur_section and idx + 1 > cur_section["question_range"][1] - 1:
+            s["is_last_in_section"] = True
+            await session_mgr.update(chat_id, s)
+
+        q = questions[idx]
+        original_q = q.copy()
+
+        target_lang = translation_mgr.get_language(chat_id)
+        if target_lang:
+            q = await translate_question(q, target_lang)
+
+        options = q["options"]
+        correct_id = q["correct_option_id"]
+        correct_ids = correct_id if isinstance(correct_id, list) else [correct_id]
+        is_multi = len(correct_ids) > 1
+        file_id = q.get("file_id")
+        reply_text = q.get("reply_text")
+        do_shuffle = s["quiz_data"].get("shuffle_options", False)
+        shuffle_o_count = s["quiz_data"].get("shuffle_options_count", 0)
+
+        if do_shuffle:
+            options, correct_ids = shuffle_options_multi(options, correct_ids, shuffle_o_count)
+
+        if target_lang and target_lang != "en":
+            await safe_send_message(
+                ctx, chat_id, f"\U0001F4DD <b>Original</b>\n\n{original_q['question']}", parse_mode=ParseMode.HTML
             )
+            await asyncio.sleep(0.5)
+
+        photo_msg_id = None
+        if file_id:
+            try:
+                photo_msg = await ctx.bot.send_photo(chat_id=chat_id, photo=file_id)
+                photo_msg_id = photo_msg.message_id
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+        # -- Rich-text pre-pass -------------------------------------------
+        # If the question, options, or reference text contain markup the
+        # native poll UI can't render (LaTeX, GFM tables, multi-paragraph
+        # HTML), pre-send that content via sendRichMessage before the poll.
+        _tid = s.get("message_thread_id")
+        rich_res: RichDispatchResult = await enrich_question_dispatch(
+            lambda method, params: send_raw_api(ctx, method, params),
+            lambda text: safe_send_message(ctx, chat_id, text, parse_mode=ParseMode.HTML),
+            chat_id, q, idx, len(questions), thread_id=_tid,
+        )
+        if rich_res.rich_sent:
+            await asyncio.sleep(0.5)
+
+        _q_text = rich_res.poll_question_override or q["question"]
+        _rt = None if rich_res.suppress_reply_text else reply_text
+        poll_q, poll_opts, poll_expl, overflow, poll_desc = prepare_poll_data(
+            _q_text, options, correct_ids[0], q.get("explanation"), _rt, idx, len(questions)
+        )
+        if rich_res.poll_options_override:
+            poll_opts = rich_res.poll_options_override
+        if rich_res.suppress_description:
+            poll_desc = None
+            overflow = None
+
+        if overflow:
+            await safe_send_message(ctx, chat_id, overflow, parse_mode=ParseMode.HTML)
+            await asyncio.sleep(0.5)
+
+        timer = s.get("current_section_timer", s["quiz_data"]["timer"])
+        timer += s.get("modified_timer_offset", 0)
+        timer = max(timer, 10)
+
+        poll_kwargs: dict[str, Any] = {}
+        if is_multi:
+            poll_kwargs["correct_option_ids"] = correct_ids
+            poll_kwargs["allows_multiple_answers"] = True
+        else:
+            poll_kwargs["correct_option_id"] = correct_ids[0]
+        if photo_msg_id:
+            poll_kwargs["reply_to_message_id"] = photo_msg_id
+        if poll_desc:
+            poll_kwargs["description"] = poll_desc
+
+        # Content protection (forward/save block): ON by default for every
+        # private-chat play session too, and only lifted when the quiz's own
+        # creator is playing it in their own DM -- same rule as the group
+        # path in start_quiz() (`protect = not (chat_id == creator_id and
+        # chat_type == "private")`). In a private chat chat_id IS the
+        # player's own user id, so this comparison is exact.
+        protect = not (chat_id == s["quiz_data"].get("creator_id"))
+
+        poll_msg = await safe_send_poll(
+            ctx, chat_id, question=poll_q, options=poll_opts, type=Poll.QUIZ,
+            explanation=poll_expl, is_anonymous=False, open_period=timer,
+            protect_content=protect, **poll_kwargs,
+        )
+
+        if poll_msg:
+            s["active_poll_id"] = poll_msg.poll.id
+            s["waiting_for_answer"] = True
+            s["poll_start_time"] = time.time()
+            s["current_index"] = idx
+            s["polls"][poll_msg.poll.id] = {
+                "correct_option": correct_ids, "sent_time": time.time(), "question_index": idx,
+            }
+            await session_mgr.update(chat_id, s)
+            tasks.spawn(_private_timeout(chat_id, poll_msg.poll.id, timer), name=f"quiz_{chat_id}_pvt_timeout")
+        elif idx + 1 < len(questions):
+            await asyncio.sleep(2)
+            await send_private_question(chat_id, ctx, idx + 1)
+        else:
+            await end_private_quiz(chat_id, ctx)
+    except Exception as e:
+        logger.error("send_private_question error: %s", e, exc_info=True)
+        s = session_mgr.get(chat_id)
+        if s and idx + 1 < len(s.get("questions", [])):
+            await asyncio.sleep(2)
+            await send_private_question(chat_id, ctx, idx + 1)
+
+
+async def _private_timeout(chat_id: int, poll_id: str, timer: int) -> None:
+    await asyncio.sleep(timer + 2)
+    s = session_mgr.get(chat_id)
+    if not s or s.get("active_poll_id") != poll_id:
+        return
+    s["waiting_for_answer"] = False
+    cur = s.get("current_index", 0)
+    s["current_index"] = cur + 1
+    await session_mgr.update(chat_id, s)
+
+    ctx = s.get("context")
+    if ctx and s.get("quiz_data", {}).get("show_explanation"):
+        await _send_explanation_after_poll(ctx, chat_id, s["questions"][cur], thread_id=s.get("message_thread_id"))
+
+    if s.get("is_last_in_section"):
+        s["is_last_in_section"] = False
+        await session_mgr.update(chat_id, s)
+        await _end_private_section(chat_id)
+    elif ctx and cur + 1 < len(s.get("questions", [])):
+        await asyncio.sleep(1)
+        await send_private_question(chat_id, ctx, cur + 1)
+    else:
+        await end_private_quiz(chat_id, ctx)
+
+
+async def handle_private_poll_answer(poll_id: str, user_id: int, option_ids: list, current_time: float) -> None:
+    for chat_id in list(session_mgr.sessions.keys()):
+        s = session_mgr.get(chat_id)
+        if not s or not s.get("is_private") or poll_id != s.get("active_poll_id"):
+            continue
+
+        if user_id not in s["participants"]:
+            s["participants"][user_id] = {"name": "You", "answers": {}}
+        s["participants"][user_id]["answers"][poll_id] = {"option": option_ids, "time": current_time}
+        s["waiting_for_answer"] = False
+        cur = s.get("current_index", 0)
+        await session_mgr.update(chat_id, s)
+
+        ctx = s.get("context")
+        if ctx and s.get("quiz_data", {}).get("show_explanation"):
+            await _send_explanation_after_poll(ctx, chat_id, s["questions"][cur], thread_id=s.get("message_thread_id"))
+
+        if s.get("is_last_in_section"):
+            s["is_last_in_section"] = False
+            await session_mgr.update(chat_id, s)
+            await asyncio.sleep(1.5)
+            await _end_private_section(chat_id)
+        else:
+            await asyncio.sleep(1.5)
+            if ctx and cur + 1 < len(s.get("questions", [])):
+                await send_private_question(chat_id, ctx, cur + 1)
+            else:
+                await end_private_quiz(chat_id, ctx)
+        return
+
+
+async def _end_private_section(chat_id: int) -> None:
+    s = session_mgr.get(chat_id)
+    if not s:
+        return
+    ctx = s.get("context")
+    if s.get("section_msgs"):
+        try:
+            await ctx.bot.unpin_chat_message(chat_id, s["section_msgs"][-1])
+        except Exception:
+            pass
+    sections = s.get("sections", [])
+    cur_sec = s.get("current_section")
+    if cur_sec and sections:
+        cur_end = cur_sec["question_range"][1]
+        nxt = next((sec for sec in sections if sec["question_range"][0] > cur_end), None)
+        if nxt:
+            await _private_section_start(chat_id, nxt, 0)
+            return
+    await end_private_quiz(chat_id, ctx)
+
+
+async def end_private_quiz(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        s = await session_mgr.delete(chat_id)
+        if not s:
+            return
+        quiz_data = s["quiz_data"]
+        questions = s["questions"]
+        total = len(questions)
+        neg = quiz_data.get("negative_marking", 0)
+        correct_mark = quiz_data.get("correct_mark", 1)
+
+        await safe_send_message(ctx, chat_id, "\U0001F4CA Calculating results...")
+
+        udata = s["participants"].get(chat_id, {})
+        correct = wrong = 0
+        total_time = 0.0
+        for pid, pinfo in s.get("polls", {}).items():
+            if pid in udata.get("answers", {}):
+                ans = udata["answers"][pid]
+                total_time += ans["time"] - pinfo["sent_time"]
+                if is_correct(ans["option"], pinfo["correct_option"]):
+                    correct += 1
+                else:
+                    wrong += 1
+
+        score = (correct * correct_mark) - (wrong * neg)
+        pct = (correct / total * 100) if total else 0
+        acc = (correct / (correct + wrong) * 100) if (correct + wrong) else 0
+        minutes, seconds = divmod(total_time, 60)
+
+        qid = quiz_data["question_set_id"]
+        buttons = [[InlineKeyboardButton("\U0001F504 Restart", url=f"https://t.me/share/url?url=/start {qid}")]]
+
+        qname = quiz_data.get("quiz_name", "Unnamed Quiz")
+        txt = (
+            f"\U0001F3C6 <b>Quiz Completed!</b>\n\n"
+            f"\U0001F4DD Quiz: {qname}\n\U0001F4CA Total: {total}\n\n"
+            f"\U0001F4C8 <b>Your Performance:</b>\n"
+            f"✅ Correct: {correct}\n❌ Wrong: {wrong}\n"
+            f"\U0001F3AF Score: {score:.2f}\n⏱️ Time: {int(minutes)}m {int(seconds)}s\n"
+            f"\U0001F4CA Percentage: {pct:.1f}%\n\U0001F3AF Accuracy: {acc:.1f}%"
+        )
+        await safe_send_message(ctx, chat_id, txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+        await _record_attempt_and_report(
+            ctx, chat_id, quiz_data, [{
+                "user_id": chat_id, "name": "You", "correct": correct, "wrong": wrong,
+                "score": score, "total_time": total_time, "answers": udata.get("answers", {}),
+            }], chat_title="Direct Message", protect_type=False, thread_id=None,
+        )
+    except Exception as e:
+        logger.error("end_private_quiz error: %s", e, exc_info=True)
+        await safe_send_message(ctx, chat_id, "❌ Error generating results.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GROUP QUIZ
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def run_group_quiz(
+    chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, questions: list[dict], quiz: dict,
+    protect_type: bool, update: Any, skip: int = 0,
+) -> None:
+    """Main group quiz loop -- one long-lived coroutine per running quiz."""
+    try:
+        sections = quiz.get("sections", [])
+        if sections:
+            sections.sort(key=lambda s: s["question_range"][0])
+            await _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect_type, update, skip)
+        else:
+            await _run_flat_quiz(chat_id, ctx, questions, quiz, protect_type, update, skip)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.error("run_group_quiz fatal error chat=%s: %s", chat_id, e, exc_info=True)
+        await safe_send_message(ctx, chat_id, f"❌ Quiz error: {e}")
+
+
+async def _run_flat_quiz(chat_id, ctx, questions, quiz, protect, update, skip) -> None:
+    total = len(questions)
+    base_timer = quiz["timer"]
+    do_shuffle = quiz.get("shuffle_options", False)
+    promo = quiz.get("promo_message", "")
+
+    for idx in range(skip, total):
+        session = session_mgr.get(chat_id)
+        if not session:
+            return
+        await wait_until_resumed(chat_id)
+        session = session_mgr.get(chat_id)
+        if not session:
+            return
+
+        success = await _send_group_question(chat_id, ctx, questions, idx, total, base_timer, do_shuffle, protect, session)
+        if not success:
+            await safe_send_message(ctx, chat_id, f"⚠️ Skipped Q{idx + 1} (send error)")
+            await asyncio.sleep(2)
+            continue
+
+        timer = max(base_timer + session.get("modified_timer_offset", 0), 10)
+        timer = _apply_char_boost(questions[idx], timer)
+        await asyncio.sleep(timer + 2)
+
+        if quiz.get("show_explanation"):
+            await _send_explanation_after_poll(ctx, chat_id, questions[idx], thread_id=session.get("message_thread_id"))
+
+        if promo and (idx + 1) % 10 == 0 and (idx + 1) < total:
+            await safe_send_message(ctx, chat_id, promo)
+            await asyncio.sleep(1)
+
+        if MID_QUIZ_LB_INTERVAL > 0 and (idx + 1) % MID_QUIZ_LB_INTERVAL == 0 and (idx + 1) < total:
+            await _send_mid_quiz_leaderboard(chat_id, ctx, idx + 1, total)
+            await asyncio.sleep(1)
+
+    await _end_group_quiz(chat_id, ctx, update, quiz, protect)
+
+
+async def _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect, update, skip) -> None:
+    base_timer = quiz["timer"]
+    do_shuffle = quiz.get("shuffle_options", False)
+    promo = quiz.get("promo_message", "")
+    q_count = 0
+
+    start_sec_idx = 0
+    for i, sec in enumerate(sections):
+        if skip < sec["question_range"][1]:
+            start_sec_idx = i
+            break
+
+    for sec_idx in range(start_sec_idx, len(sections)):
+        section = sections[sec_idx]
+        start_q, end_q = section["question_range"]
+        sec_name = section.get("name", f"Section {start_q}–{end_q}")
+        sec_timer = section.get("timer", base_timer)
+        mode = section.get("mode", "perpoll")
+        slot_mins = section.get("slot_minutes", 20)
+        n_qs_sec = end_q - start_q
+
+        session = session_mgr.get(chat_id)
+        if not session:
+            return
+
+        mode_lbl = f"\U0001F550 {slot_mins} min total slot" if mode == "slot" else f"⏱ {sec_timer}s per question"
+        global_cm = quiz.get("correct_mark", 1)
+        global_neg = quiz.get("negative_marking", 0)
+        sec_cm = section.get("correct_mark", global_cm)
+        sec_neg = section.get("neg_mark", global_neg)
+
+        sec_msg = await safe_send_message(
+            ctx, chat_id,
+            f"\U0001F4DA <b>{sec_name}</b>\n\U0001F4CB Q{start_q}–{end_q}  ({n_qs_sec} questions)\n"
+            f"{mode_lbl}  ·  Marks: +{sec_cm} / -{sec_neg}",
+            parse_mode=ParseMode.HTML,
+        )
+        if sec_msg:
+            try:
+                await ctx.bot.pin_chat_message(chat_id, sec_msg.message_id)
+            except Exception:
+                pass
+            session.setdefault("section_msgs", []).append(sec_msg.message_id)
+            await session_mgr.update(chat_id, session)
+
+        await asyncio.sleep(1)
+        first_q = max(skip if sec_idx == start_sec_idx else 0, start_q - 1)
+        sec_questions = list(range(first_q, min(end_q, len(questions))))
+
+        if mode == "slot":
+            FLOOD_GAP = 3
+            slot_secs = slot_mins * 60
+            flood_total = max(0, len(sec_questions) - 1) * FLOOD_GAP
+            slot_start = None
+
+            for rel_idx, idx in enumerate(sec_questions):
+                session = session_mgr.get(chat_id)
+                if not session:
+                    return
+                await wait_until_resumed(chat_id)
+                session = session_mgr.get(chat_id)
+                if not session:
+                    return
+
+                success = await _send_group_question(chat_id, ctx, questions, idx, len(questions), 0, do_shuffle, protect, session)
+                q_count += 1
+                if rel_idx == 0 and success:
+                    slot_start = time.time()
+                if not success:
+                    await safe_send_message(ctx, chat_id, f"⚠️ Skipped Q{idx + 1}")
+                if rel_idx < len(sec_questions) - 1:
+                    await asyncio.sleep(FLOOD_GAP)
+
+            close_budget = len(sec_questions) * 3.5
+            fair_slot = slot_secs + flood_total
+            if slot_start:
+                elapsed = time.time() - slot_start
+                remaining = max(0, fair_slot - elapsed - close_budget)
+                mins_r, secs_r = divmod(int(remaining + close_budget), 60)
+                await safe_send_message(
+                    ctx, chat_id,
+                    f"⏳ <b>{sec_name}</b> — all {len(sec_questions)} questions sent!\n"
+                    f"Section closes in <b>{mins_r}m {secs_r}s</b>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                await asyncio.sleep(remaining)
+
+            await _close_section_polls(ctx, chat_id, sec_questions)
+            await safe_send_message(
+                ctx, chat_id, f"\U0001F514 <b>{sec_name}</b> — time's up! All polls closed.", parse_mode=ParseMode.HTML
+            )
+        else:
+            for idx in sec_questions:
+                session = session_mgr.get(chat_id)
+                if not session:
+                    return
+                await wait_until_resumed(chat_id)
+                session = session_mgr.get(chat_id)
+                if not session:
+                    return
+
+                success = await _send_group_question(chat_id, ctx, questions, idx, len(questions), sec_timer, do_shuffle, protect, session)
+                q_count += 1
+                if not success:
+                    await safe_send_message(ctx, chat_id, f"⚠️ Skipped Q{idx + 1}")
+                    await asyncio.sleep(2)
+                    continue
+
+                timer = max(sec_timer + session.get("modified_timer_offset", 0), 10)
+                timer = _apply_char_boost(questions[idx], timer)
+                await asyncio.sleep(timer + 2)
+
+                if quiz.get("show_explanation"):
+                    await _send_explanation_after_poll(ctx, chat_id, questions[idx], thread_id=session.get("message_thread_id"))
+
+                if promo and q_count % 10 == 0:
+                    await safe_send_message(ctx, chat_id, promo)
+                    await asyncio.sleep(1)
+
+                if MID_QUIZ_LB_INTERVAL > 0 and q_count % MID_QUIZ_LB_INTERVAL == 0:
+                    total_qs = len(quiz.get("questions", []))
+                    if q_count < total_qs:
+                        await _send_mid_quiz_leaderboard(chat_id, ctx, q_count, total_qs)
+                        await asyncio.sleep(1)
+
+        if sec_msg:
+            try:
+                await ctx.bot.unpin_chat_message(chat_id, sec_msg.message_id)
+            except Exception:
+                pass
+
+    await _end_group_quiz(chat_id, ctx, update, quiz, protect)
+
+
+async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, do_shuffle, protect, session) -> bool:
+    """Send a single question in a group. Returns True on success."""
+    try:
+        q = questions[idx]
+        original_q = q.copy()
+
+        target_lang = translation_mgr.get_language(chat_id)
+        if target_lang:
+            q = await translate_question(q, target_lang)
+
+        options = q["options"]
+        correct_id = q["correct_option_id"]
+        correct_ids = correct_id if isinstance(correct_id, list) else [correct_id]
+        is_multi = len(correct_ids) > 1
+        file_id = q.get("file_id")
+        reply_text = q.get("reply_text")
+
+        if do_shuffle:
+            shuffle_o_count = (session.get("quiz_data") or {}).get("shuffle_options_count", 0)
+            options, correct_ids = shuffle_options_multi(options, correct_ids, shuffle_o_count)
+
+        if target_lang and target_lang != "en":
+            await safe_send_message(
+                ctx, chat_id, f"\U0001F4DD <b>Original</b>\n\n{original_q['question']}", parse_mode=ParseMode.HTML
+            )
+            await asyncio.sleep(0.5)
+
+        photo_msg_id = None
+        if file_id:
+            try:
+                photo_msg = await ctx.bot.send_photo(chat_id=chat_id, photo=file_id)
+                photo_msg_id = photo_msg.message_id
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+        # -- Rich-text pre-pass (see send_private_question for details) ----
+        _tid = session.get("message_thread_id")
+        rich_res: RichDispatchResult = await enrich_question_dispatch(
+            lambda method, params: send_raw_api(ctx, method, params),
+            lambda text: safe_send_message(ctx, chat_id, text, parse_mode=ParseMode.HTML),
+            chat_id, q, idx, total, thread_id=_tid,
+        )
+        if rich_res.rich_sent:
+            await asyncio.sleep(0.3)
+
+        _q_text = rich_res.poll_question_override or q["question"]
+        _rt = None if rich_res.suppress_reply_text else reply_text
+        poll_q, poll_opts, poll_expl, overflow, poll_desc = prepare_poll_data(
+            _q_text, options, correct_ids[0], q.get("explanation"), _rt, idx, total
+        )
+        if rich_res.poll_options_override:
+            poll_opts = rich_res.poll_options_override
+        if rich_res.suppress_description:
+            poll_desc = None
+            overflow = None
+
+        if overflow:
+            await safe_send_message(ctx, chat_id, overflow, parse_mode=ParseMode.HTML)
+            await asyncio.sleep(0.3)
+
+        timer = base_timer + session.get("modified_timer_offset", 0)
+        if timer > 0:
+            timer = max(timer, 10)
+
+        poll_kwargs: dict[str, Any] = {}
+        if is_multi:
+            poll_kwargs["correct_option_ids"] = correct_ids
+            poll_kwargs["allows_multiple_answers"] = True
+        else:
+            poll_kwargs["correct_option_id"] = correct_ids[0]
+        if photo_msg_id:
+            poll_kwargs["reply_to_message_id"] = photo_msg_id
+        if poll_desc:
+            poll_kwargs["description"] = poll_desc
+
+        poll_msg = await safe_send_poll(
+            ctx, chat_id, question=poll_q, options=poll_opts, type=Poll.QUIZ,
+            explanation=poll_expl, is_anonymous=False, open_period=timer if timer > 0 else None,
+            protect_content=protect, **poll_kwargs,
+        )
+
+        if poll_msg:
+            session["polls"][poll_msg.poll.id] = {
+                "correct_option": correct_ids, "sent_time": time.time(),
+                "question_index": idx, "message_id": poll_msg.message_id,
+            }
+            session["current_index"] = idx + 1
+            await session_mgr.update(chat_id, session)
+            return True
+        return False
+    except Exception as e:
+        logger.error("_send_group_question error chat=%s Q%d: %s", chat_id, idx + 1, e, exc_info=True)
+        return False
+
+
+async def _close_section_polls(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, q_indices: list[int]) -> None:
+    """Stop all open polls for a slot-mode section, respecting Telegram's
+    group rate limit (~20 msgs/min => ~3s minimum gap between calls)."""
+    session = session_mgr.get(chat_id)
+    if not session:
+        return
+    polls = session.get("polls", {})
+    idx_set = set(q_indices)
+
+    to_close = [
+        (pdata["message_id"], poll_id)
+        for poll_id, pdata in polls.items()
+        if pdata.get("question_index") in idx_set and pdata.get("message_id")
+    ]
+    to_close.sort(key=lambda x: x[0])
+
+    for msg_id, poll_id in to_close:
+        for _attempt in range(2):
+            try:
+                await ctx.bot.stop_poll(chat_id=chat_id, message_id=msg_id)
+                break
+            except Exception as e:
+                err = str(e).lower()
+                if "retry" in err or "429" in err or "flood" in err:
+                    import re
+
+                    m = re.search(r"retry.after.(\d+)", err)
+                    wait = int(m.group(1)) + 1 if m else 5
+                    await asyncio.sleep(wait)
+                elif "poll has already been closed" in err or "message can't be modified" in err:
+                    break
+                else:
+                    break
+        await asyncio.sleep(3.5)
+
+
+async def _send_mid_quiz_leaderboard(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, q_num: int, total: int) -> None:
+    try:
+        session = session_mgr.get(chat_id)
+        if not session:
+            return
+        participants = session.get("participants", {})
+        polls = session.get("polls", {})
+        neg = session.get("quiz_data", {}).get("negative_marking", 0)
+        correct_mark = session.get("quiz_data", {}).get("correct_mark", 1)
+
+        rows = []
+        for _uid, udata in participants.items():
+            correct = wrong = 0
+            for pid, pdata in polls.items():
+                if pid not in udata["answers"]:
+                    continue
+                ans = udata["answers"][pid]
+                if is_correct(ans["option"], pdata["correct_option"]):
+                    correct += 1
+                else:
+                    wrong += 1
+            score = (correct * correct_mark) - (wrong * neg)
+            rows.append({"name": udata["name"], "correct": correct, "wrong": wrong, "score": score})
+
+        if not rows:
+            return
+        rows.sort(key=lambda x: x["score"], reverse=True)
+        text = f"\U0001F4CA <b>Live Leaderboard</b> — after Q{q_num}/{total}\n{'─' * 28}\n"
+        for rank, r in enumerate(rows[:10], 1):
+            icon = {1: "\U0001F947", 2: "\U0001F948", 3: "\U0001F949"}.get(rank, f"{rank}.")
+            text += f"{icon} <b>{str(r['name'])[:25]}</b>  ✅{r['correct']} ❌{r['wrong']}  \U0001F3AF {r['score']:.1f}\n"
+        await safe_send_message(ctx, chat_id, text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error("_send_mid_quiz_leaderboard error: %s", e)
+
+
+async def _send_explanation_after_poll(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, q: dict, thread_id: Optional[int] = None) -> None:
+    """Send the post-answer explanation. Uses sendRichMessage (Bot API 10.1)
+    when the explanation contains rich/math markup that the plain 4096-char
+    text send would mangle or truncate too aggressively; falls back to a
+    plain HTML message otherwise (or automatically, if sendRichMessage
+    isn't available on the receiving client)."""
+    try:
+        expl = (q.get("explanation") or "").strip()
+        if not expl:
+            return
+        await asyncio.sleep(1.5)
+        kw: dict[str, Any] = {}
+        if thread_id:
+            kw["message_thread_id"] = thread_id
+
+        if _is_rich(expl):
+            body = _normalise_math_spacing(f"\U0001F4A1 **Explanation:**\n\n{expl}")
+            await send_rich_or_fallback(
+                lambda method, params: send_raw_api(ctx, method, params),
+                lambda text: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, **kw),
+                chat_id, body, thread_id=thread_id,
+            )
+            return
+
+        await ctx.bot.send_message(
+            chat_id=chat_id, text=f"\U0001F4A1 <b>Explanation:</b>\n\n{expl[:4000]}", parse_mode=ParseMode.HTML, **kw,
+        )
+    except Exception as e:
+        logger.debug("_send_explanation_after_poll: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# END-OF-QUIZ SCORING / REPORTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _end_group_quiz(chat_id, ctx, update, quiz, protect_type) -> None:
+    try:
+        await end_quiz(update, ctx, quiz.get("question_set_id", ""), protect_type)
+    except Exception as e:
+        logger.error("_end_group_quiz error: %s", e, exc_info=True)
+
+
+def _lb_rich_md(quiz_name: str, chunk: list, start_rank: int, total: int, sections: Optional[list] = None) -> str:
+    """Build a GFM table leaderboard string for sendRichMessage (up to ~100
+    rows per chunk), including a per-section top-5 breakdown when the quiz
+    has sections. Ported from the original's `_lb_rich_md`."""
+    lines = [
+        f"### \U0001F3C6 {quiz_name}",
+        "",
+        "| # | Name | ✅ | ❌ | Score | Time | % |",
+        "|--:|:-----|--:|--:|------:|-----:|--:|",
+    ]
+    for j, u in enumerate(chunk, start=start_rank):
+        icon = "\U0001F947" if j == 1 else "\U0001F948" if j == 2 else "\U0001F949" if j == 3 else str(j)
+        pct = (u["correct"] / total * 100) if total else 0
+        m, sec = divmod(int(u["total_time"]), 60)
+        name = str(u["name"])[:22].replace("|", "\\|")
+        lines.append(
+            f"| {icon} | {name} | {u['correct']} | {u['wrong']} |"
+            f" {u['score']:.2f} | {int(m)}m {int(sec)}s | {pct:.0f}% |"
+        )
+
+    if sections:
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("### \U0001F4DA Section Breakdown")
+        lines.append("")
+        for sec in sections:
+            sec_name = sec.get("name", f"Section {sec['question_range'][0]}-{sec['question_range'][1]}")
+            s, e = sec["question_range"]
+            q_count = e - s + 1
+            mode_lbl = "\U0001F550 Slot" if sec.get("mode") == "slot" else "⏱ Per-poll"
+            cm_lbl = sec.get("correct_mark", "—")
+            neg_lbl = sec.get("neg_mark", "—")
+            timer_lbl = (
+                f"{sec.get('slot_minutes')}min slot" if sec.get("mode") == "slot"
+                else f"{sec.get('timer', '—')}s/poll"
+            )
+            lines.append(f"#### {sec_name}  ·  Q{s}–{e} ({q_count}Qs)  ·  {mode_lbl}  ·  {timer_lbl}")
+            lines.append(f"Marking: **+{cm_lbl}** / **-{neg_lbl}**")
+            lines.append("")
+
+            sec_rows = []
+            for u in chunk:
+                sec_score = u.get("section_scores", {}).get(sec_name, {})
+                sec_rows.append({
+                    "name": u["name"],
+                    "correct": sec_score.get("correct", 0),
+                    "wrong": sec_score.get("wrong", 0),
+                    "score": sec_score.get("score", 0.0),
+                })
+            sec_rows.sort(key=lambda x: x["score"], reverse=True)
+
+            lines.append("| # | Name | ✅ | ❌ | Sec.Score |")
+            lines.append("|--:|:-----|--:|--:|----------:|")
+            for r, row in enumerate(sec_rows[:5], 1):
+                icon = "\U0001F947" if r == 1 else "\U0001F948" if r == 2 else "\U0001F949" if r == 3 else f"{r}."
+                lines.append(
+                    f"| {icon} | {str(row['name'])[:20].replace('|', chr(92) + '|')} |"
+                    f" {row['correct']} | {row['wrong']} | {row['score']:.2f} |"
+                )
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+async def end_quiz(update: Any, ctx: ContextTypes.DEFAULT_TYPE, quiz_id: str, protect_type: bool) -> None:
+    """Compute the leaderboard for a finished/stopped group quiz, post it,
+    and (if enabled for this chat) generate HTML/PDF reports."""
+    chat_id: Optional[int] = None
+    try:
+        if getattr(update, "message", None) is not None:
+            chat_id = update.message.chat_id
+        elif getattr(update, "callback_query", None) is not None:
+            chat_id = update.callback_query.message.chat_id
+        elif hasattr(update, "_chat_id"):
+            chat_id = update._chat_id
+        else:
+            logger.error("end_quiz: cannot determine chat_id from update")
+            return
+
+        chat_title = "Quiz Group"
+        try:
+            chat_info = await ctx.bot.get_chat(chat_id)
+            if chat_info.title:
+                chat_title = chat_info.title
+            elif chat_info.first_name:
+                chat_title = chat_info.first_name
+                if chat_info.username:
+                    chat_title += f" (@{chat_info.username})"
         except Exception:
             pass
 
+        pre_sess = session_mgr.get(chat_id)
+        end_tid = pre_sess.get("message_thread_id") if pre_sess else None
 
-async def gate(context, uid):
-    if uid == ADMIN_ID:
-        return True
-    if await is_member(context.bot, uid):
-        await credit_referral(context, uid)
-        return True
-    return False
+        session = await session_mgr.delete(chat_id)
+        msg_kwargs = {"message_thread_id": end_tid} if end_tid else {}
+        placeholder = await safe_send_message(ctx, chat_id, "Generating Result...", **msg_kwargs)
 
+        if not session or session["quiz_id"] != quiz_id:
+            if placeholder:
+                await placeholder.edit_text("❌ No quiz found with this ID.")
+            return
 
-def register(uid, args):
-    users = load_users()
-    is_new = str(uid) not in users
-    rec = get_user(users, uid)
-    if is_new and args and args[0].startswith("ref_"):
-        try:
-            ref = int(args[0][4:])
-        except ValueError:
-            ref = None
-        if ref and ref != uid and str(ref) in users:
-            rec["ref_by"] = ref
-    save_users(users)
+        quiz_data = session.get("quiz_data")
+        if not quiz_data:
+            repo = QuizRepository(get_db())
+            quiz_data = await repo.get(quiz_id)
+        if not quiz_data:
+            if placeholder:
+                await placeholder.edit_text("❌ Quiz data not found.")
+            return
 
+        total = len(quiz_data["questions"])
+        quiz_name = quiz_data.get("quiz_name", "Unnamed Quiz")
+        neg = quiz_data.get("negative_marking", 0)
+        correct_mark = quiz_data.get("correct_mark", 1)
+        sections = quiz_data.get("sections", [])
 
-# ---------- Screens ----------
-def join_screen():
-    text = (
-        "🔒 <b>Channel join karna zaroori hai</b>\n\n"
-        f"Bot use karne ke liye pehle {h(CHANNEL)} join karo, phir "
-        "<b>“Maine join kar liya”</b> dabao."
-    )
-    kb = Markup(
-        [
-            [Btn("📢 Channel join karo", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
-            [Btn("✅ Maine join kar liya", callback_data="chk")],
-        ]
-    )
-    return text, kb
+        leaderboard = []
+        for uid, udata in session["participants"].items():
+            correct = wrong = 0
+            total_time = 0.0
+            user_answers: dict[str, Any] = {}
+            section_scores: dict[str, dict] = {}
 
+            for pid, pdata in session["polls"].items():
+                if pid not in udata["answers"]:
+                    continue
+                ans = udata["answers"][pid]
+                total_time += ans["time"] - pdata["sent_time"]
+                q_idx = pdata.get("question_index", 0)
+                user_answers[f"q{q_idx}"] = ans["option"]
 
-def home_screen(uid, welcome_name=None):
-    admin = uid == ADMIN_ID
-    items = load()
-    rows = [[Btn(f"🏫 {c['title']}", callback_data=f"c:{i}")] for i, c in enumerate(items)]
-    if admin:
-        rows.append([Btn("➕ Coaching add karo", callback_data="addc")])
-    else:
-        rows.append([Btn(f"🎁 Refer karo (+{REFER_BONUS} tests)", callback_data="ref")])
-    text = f"👋 <b>Namaste {h(welcome_name)}!</b>\n\n" if welcome_name else ""
-    text += "🏫 <b>Coaching chuno</b> 👇" if items else "Abhi koi coaching available nahi hai."
-    if admin:
-        text += "\n\n👑 <i>Owner mode: /stats · /broadcast · /help</i>"
-    else:
-        rem = remaining(get_user(load_users(), uid))
-        text += f"\n\n🎯 Bache hue tests: <b>{max(rem, 0)}</b>"
-    return text, Markup(rows)
+                sec = get_section_for_question(sections, q_idx)
+                q_cm, q_neg = section_marks(sec, correct_mark, neg)
+                sec_name = sec.get("name", "default") if sec else "default"
+                section_scores.setdefault(sec_name, {"correct": 0, "wrong": 0, "score": 0.0})
 
+                if is_correct(ans["option"], pdata["correct_option"]):
+                    correct += 1
+                    section_scores[sec_name]["correct"] += 1
+                    section_scores[sec_name]["score"] += q_cm
+                else:
+                    wrong += 1
+                    section_scores[sec_name]["wrong"] += 1
+                    section_scores[sec_name]["score"] -= q_neg
 
-def ref_screen(uid, bot_username, limit_reached=False):
-    rec = get_user(load_users(), uid)
-    link = f"https://t.me/{bot_username}?start=ref_{uid}"
-    text = "⚠️ <b>Tumhare free tests khatam ho gaye.</b>\n\n" if limit_reached else ""
-    text += (
-        f"🎁 <b>Har 1 refer par {REFER_BONUS} naye tests!</b>\n\n"
-        f"🔗 Tumhara refer link (tap karke copy karo):\n<code>{link}</code>\n\n"
-        f"👥 Ab tak refer: <b>{rec['invited']}</b>\n"
-        f"🎯 Bache hue tests: <b>{max(remaining(rec), 0)}</b>\n\n"
-        "<i>Refer tab count hota hai jab dost bot start karke channel join kar le.</i>"
-    )
-    share = f"https://t.me/share/url?url={quote(link)}&text={quote('Ye bot try karo 👇')}"
-    kb = Markup(
-        [
-            [Btn("📤 Dost ko bhejo", url=share)],
-            [Btn("⬅️ Back", callback_data="home")],
-        ]
-    )
-    return text, kb
+            score = (
+                sum(v["score"] for v in section_scores.values())
+                if section_scores else (correct * correct_mark) - (wrong * neg)
+            )
+            leaderboard.append({
+                "user_id": uid, "name": udata["name"], "correct": correct, "wrong": wrong,
+                "score": round(score, 4), "total_time": total_time, "answers": user_answers,
+                "section_scores": section_scores,
+            })
 
+        if not leaderboard:
+            if placeholder:
+                await placeholder.edit_text(f"\U0001F3C6 Quiz '{quiz_name}' ended!\n\n❌ No answers recorded.")
+            return
 
-def coaching_screen(i, admin):
-    c = load()[i]
-    rows = [[Btn(f"📚 {s['title']}", callback_data=f"s:{i}:{j}")] for j, s in enumerate(c["sections"])]
-    if admin:
-        rows.append([Btn("➕ Section add karo", callback_data=f"addsec:{i}")])
-        rows.append(
-            [
-                Btn("✏️ Naam badlo", callback_data=f"rnc:{i}"),
-                Btn("🗑 Delete", callback_data=f"dc:{i}"),
-            ]
-        )
-    rows.append([Btn("⬅️ Back", callback_data="home")])
-    text = f"🏫 <b>{h(c['title'])}</b>\n\n"
-    text += "📚 Section chuno 👇" if c["sections"] else "Abhi koi section nahi hai."
-    return text, Markup(rows)
+        leaderboard.sort(key=lambda x: (x["score"], -x["total_time"]), reverse=True)
 
+        if placeholder:
+            try:
+                await placeholder.delete()
+            except Exception:
+                pass
 
-def section_screen(i, j, admin):
-    c = load()[i]
-    s = c["sections"][j]
-    rows = grid([Btn(f"📂 {u['title']}", callback_data=f"u:{i}:{j}:{k}") for k, u in enumerate(s["subs"])])
-    if admin:
-        rows.append([Btn("➕ Subsection add karo", callback_data=f"addsub:{i}:{j}")])
-        rows.append(
-            [
-                Btn("✏️ Naam badlo", callback_data=f"rnsec:{i}:{j}"),
-                Btn("🗑 Delete", callback_data=f"dsec:{i}:{j}"),
-            ]
-        )
-    rows.append([Btn("⬅️ Back", callback_data=f"c:{i}")])
-    text = f"🏫 {h(c['title'])} › 📚 <b>{h(s['title'])}</b>\n\n"
-    text += "📂 Subsection chuno 👇" if s["subs"] else "Abhi koi subsection nahi hai."
-    return text, Markup(rows)
-
-
-def sub_screen(i, j, k, admin, extra=""):
-    c = load()[i]
-    s = c["sections"][j]
-    u = s["subs"][k]
-    rows = []
-    if admin:
-        rows.append([Btn("➕ HTML file daalo", callback_data=f"addf:{i}:{j}:{k}")])
-        rows.append(
-            [
-                Btn("✏️ Naam badlo", callback_data=f"rnsub:{i}:{j}:{k}"),
-                Btn("🗑 Delete", callback_data=f"dsub:{i}:{j}:{k}"),
-            ]
-        )
-    rows.append([Btn("⬅️ Back", callback_data=f"s:{i}:{j}")])
-    n = len(u["files"])
-    text = f"🏫 {h(c['title'])} › 📚 {h(s['title'])} › 📂 <b>{h(u['title'])}</b>\n\n"
-    text += f"📎 {n} HTML file" if n else "Abhi koi file nahi hai."
-    return text + extra, Markup(rows)
-
-
-# ---------- Commands ----------
-async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE, welcome=False):
-    user = update.effective_user
-    if not await gate(context, user.id):
-        text, kb = join_screen()
-    else:
-        text, kb = home_screen(user.id, user.first_name if welcome else None)
-    await update.message.reply_text(text, reply_markup=kb, parse_mode=HTML)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register(update.effective_user.id, context.args)
-    await show_home(update, context, welcome=True)
-
-
-async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🆔 Tumhari Telegram ID: <code>{update.effective_user.id}</code>", parse_mode=HTML)
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("pending", None)
-    await show_home(update, context)
-
-
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    pending = context.user_data.pop("pending", None)
-    if pending and pending[0] == "f":
-        i, j, k = pending[1:]
-        text, kb = sub_screen(i, j, k, True)
-        await update.message.reply_text("✅ Upload poora.\n\n" + text, reply_markup=kb, parse_mode=HTML)
-    else:
-        await show_home(update, context)
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID:
-        text = (
-            "👑 <b>Owner commands</b>\n\n"
-            "/start – home menu\n"
-            "/id – apni Telegram ID dekho\n"
-            "/stats – users aur usage ka hisaab\n"
-            "/broadcast <i>message</i> – sabko message bhejo\n"
-            "/done – multiple file upload poora karo\n"
-            "📎 Koi bhi test .html seedha bhejo → MOCK MARG HTML + PDF banke wapas aayegi\n"
-            "/cancel – kuch bhi beech me rokna\n\n"
-            "Coaching → Section → Subsection → HTML file, sab buttons se add hota hai."
-        )
-    else:
-        text = (
-            "ℹ️ <b>Kaise use karein</b>\n\n"
-            "/start dabao → Coaching → Section → Subsection chuno, test file mil jayegi.\n"
-            f"Har user ko {FREE_TESTS} free tests milte hain. Aur tests ke liye 🎁 Refer karo — "
-            f"1 refer par {REFER_BONUS} tests."
-        )
-    await update.message.reply_text(text, parse_mode=HTML)
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    users = load_users()
-    items = load()
-    secs = sum(len(c["sections"]) for c in items)
-    subs = sum(len(s["subs"]) for c in items for s in c["sections"])
-    files = sum(len(u["files"]) for c in items for s in c["sections"] for u in s["subs"])
-    opened = sum(u["used"] for u in users.values())
-    refs = sum(u["invited"] for u in users.values())
-    text = (
-        "📊 <b>Bot stats</b>\n\n"
-        f"👥 Total users: <b>{len(users)}</b>\n"
-        f"📖 Tests khole gaye: <b>{opened}</b>\n"
-        f"🎁 Successful refer: <b>{refs}</b>\n\n"
-        f"🏫 Coaching: {len(items)} · 📚 Sections: {secs}\n"
-        f"📂 Subsections: {subs} · 📎 Files: {files}"
-    )
-    await update.message.reply_text(text, parse_mode=HTML)
-
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    msg = update.message.text.partition(" ")[2].strip()
-    if not msg:
-        await update.message.reply_text("Format: /broadcast Aapka message yahan")
-        return
-    users = load_users()
-    ok = fail = 0
-    await update.message.reply_text(f"📣 {len(users)} users ko bhej raha hoon…")
-    for uid in users:
-        try:
-            await context.bot.send_message(int(uid), msg)
-            ok += 1
-        except Exception:
-            fail += 1
-        await asyncio.sleep(0.05)
-    await update.message.reply_text(f"✅ Bhej diya: {ok}\n❌ Fail (block/left): {fail}")
-
-
-# ---------- Buttons ----------
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    admin = uid == ADMIN_ID
-    cmd, *rest = q.data.split(":")
-    n = [int(x) for x in rest]
-
-    if not admin and not await gate(context, uid):
-        if cmd == "chk":
-            await q.answer("❌ Abhi tak channel join nahi kiya.", show_alert=True)
-        else:
-            await q.answer()
-            text, kb = join_screen()
-            await edit(q, text, kb)
-        return
-
-    await q.answer()
-    if cmd in ADMIN_ONLY and not admin:
-        return
-
-    items = load()
-    try:
-        if cmd in ("home", "chk"):
-            text, kb = home_screen(uid)
-            await edit(q, text, kb)
-
-        elif cmd == "ref":
-            text, kb = ref_screen(uid, context.bot.username)
-            await edit(q, text, kb)
-
-        elif cmd == "c":
-            text, kb = coaching_screen(n[0], admin)
-            await edit(q, text, kb)
-
-        elif cmd == "s":
-            text, kb = section_screen(n[0], n[1], admin)
-            await edit(q, text, kb)
-
-        elif cmd == "u":
-            i, j, k = n
-            sub = items[i]["sections"][j]["subs"][k]
-            extra = ""
-            if not admin and sub["files"]:
-                users = load_users()
-                rec = get_user(users, uid)
-                if remaining(rec) <= 0:
-                    text, kb = ref_screen(uid, context.bot.username, limit_reached=True)
-                    await edit(q, text, kb)
-                    return
-                rec["used"] += 1
-                save_users(users)
-                extra = f"\n\n🎯 Bache hue tests: <b>{max(remaining(rec), 0)}</b>"
-            text, kb = sub_screen(i, j, k, admin, extra)
-            await edit(q, text, kb)
-            for f in sub["files"]:
-                caption = make_caption(f.get("title") or _stem_title(f.get("name")))
-                if "file_id" in f:
-                    await context.bot.send_document(
-                        q.message.chat_id, f["file_id"], caption=caption, parse_mode=HTML
-                    )
-                elif os.path.exists(f.get("path", "")):
-                    with open(f["path"], "rb") as fh:
-                        await context.bot.send_document(
-                            q.message.chat_id, fh, filename=f["name"], caption=caption, parse_mode=HTML
-                        )
-
-        elif cmd == "addc":
-            context.user_data["pending"] = ("c",)
-            await edit(q, "✍️ <b>Coaching ka naam bhejo</b>\n<i>Ek saath kai: har line me ek naam. (cancel: /cancel)</i>")
-
-        elif cmd == "addsec":
-            context.user_data["pending"] = ("sec", n[0])
-            await edit(q, "✍️ <b>Section ka naam bhejo</b>\n<i>Ek saath kai: har line me ek naam. (cancel: /cancel)</i>")
-
-        elif cmd == "addsub":
-            context.user_data["pending"] = ("sub", n[0], n[1])
-            await edit(q, "✍️ <b>Subsection ka naam bhejo</b>\n<i>Ek saath kai: har line me ek naam. (cancel: /cancel)</i>")
-
-        elif cmd == "addf":
-            context.user_data["pending"] = ("f", n[0], n[1], n[2])
-            await edit(
-                q,
-                "📎 <b>Ab .html (ya .pdf) file(s) bhejo</b>\n<i>HTML automatically MOCK MARG design me convert hogi (+ PDF).</i>\nEk saath kai files bhej sakte ho.\n"
-                "<i>Khatam hone par /done dabao (cancel: /cancel)</i>",
+        for i in range(0, len(leaderboard), 100):
+            chunk = leaderboard[i:i + 100]
+            if i > 0:
+                await asyncio.sleep(3)
+            rich_md = _lb_rich_md(quiz_name, chunk, i + 1, total, sections)
+            await send_rich_or_fallback(
+                lambda method, params: send_raw_api(ctx, method, params),
+                lambda text: safe_send_message(ctx, chat_id, text, **msg_kwargs),
+                chat_id, rich_md, thread_id=end_tid,
             )
 
-        elif cmd == "rnc":
-            context.user_data["pending"] = ("rn", "c", n[0])
-            await edit(q, "✏️ <b>Naya naam bhejo</b>\n<i>(cancel: /cancel)</i>")
-
-        elif cmd == "rnsec":
-            context.user_data["pending"] = ("rn", "sec", n[0], n[1])
-            await edit(q, "✏️ <b>Naya naam bhejo</b>\n<i>(cancel: /cancel)</i>")
-
-        elif cmd == "rnsub":
-            context.user_data["pending"] = ("rn", "sub", n[0], n[1], n[2])
-            await edit(q, "✏️ <b>Naya naam bhejo</b>\n<i>(cancel: /cancel)</i>")
-
-        elif cmd == "dc":
-            items.pop(n[0])
-            save(items)
-            text, kb = home_screen(uid)
-            await edit(q, "🗑 Coaching hata di.\n\n" + text, kb)
-
-        elif cmd == "dsec":
-            i, j = n
-            items[i]["sections"].pop(j)
-            save(items)
-            text, kb = coaching_screen(i, admin)
-            await edit(q, "🗑 Section hata diya.\n\n" + text, kb)
-
-        elif cmd == "dsub":
-            i, j, k = n
-            items[i]["sections"][j]["subs"].pop(k)
-            save(items)
-            text, kb = section_screen(i, j, admin)
-            await edit(q, "🗑 Subsection hata diya.\n\n" + text, kb)
-
-    except (IndexError, KeyError):
-        text, kb = home_screen(uid)
-        await edit(q, "Ye item ab available nahi hai.\n\n" + text, kb)
+        await _record_attempt_and_report(
+            ctx, chat_id, quiz_data, leaderboard, chat_title=chat_title,
+            protect_type=protect_type, thread_id=end_tid,
+        )
+    except Exception as e:
+        logger.error("end_quiz error: %s", e, exc_info=True)
+        if chat_id is not None:
+            await safe_send_message(ctx, chat_id, "❌ Error generating results.")
 
 
-# ---------- Admin text / file input ----------
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    pending = context.user_data.get("pending")
-    msg = update.message
-    if not pending:
-        d = msg.document
-        if d and (d.file_name or "").lower().endswith((".html", ".htm")):
-            _, note = await make_test_file(context, msg.chat_id, d)
-            await msg.reply_text(note, parse_mode=HTML)
-        return
+async def _record_attempt_and_report(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz_data: dict, leaderboard: list[dict],
+    *, chat_title: str, protect_type: bool, thread_id: Optional[int],
+) -> None:
+    """Persist attempts/leaderboard rows to the DB and send HTML/PDF reports
+    if enabled for this chat. Replaces the old local quiz_results/*.json
+    file-storage approach entirely -- everything lands in SQLite."""
+    from quizbot.database import ChatSettingsRepository
 
-    kind = pending[0]
-    items = load()
+    qid = quiz_data.get("question_set_id", "")
+    total = len(quiz_data.get("questions", []))
+    db = get_db()
 
-    if kind in ("c", "sec", "sub", "rn"):
-        if not msg.text:
-            await msg.reply_text("Naam text me bhejo.")
-            return
-        names = [x.strip() for x in msg.text.splitlines() if x.strip()]
-        name = names[0]
+    # Persist a completed attempt + leaderboard row per participant (if the
+    # quiz exists in the DB -- ad-hoc AI/PDF/mix quizzes are not persisted
+    # since they have no qid row to reference).
+    quiz_repo = QuizRepository(db)
+    quiz_exists = bool(await quiz_repo.get(qid)) if qid else False
+    if quiz_exists:
+        attempt_repo = AttemptRepository(db)
+        mistake_repo = MistakeRepository(db)
+        stats_repo = QuestionStatsRepository(db)
+        wrong_by_q: dict[int, int] = {}
+        total_by_q: dict[int, int] = {}
+
+        for entry in leaderboard:
+            user_id = entry["user_id"]
+            if not isinstance(user_id, int):
+                continue
+            attempt = await attempt_repo.start(user_id, qid, quiz_data.get("quiz_name", ""), total)
+            await attempt_repo.update(attempt["attempt_id"], answers=entry.get("answers", {}), score=int(entry["score"]))
+            await attempt_repo.complete(attempt["attempt_id"], int(entry["score"]), str(entry["name"]))
+
+            mistakes = []
+            for q_key, ans in entry.get("answers", {}).items():
+                try:
+                    q_idx = int(q_key.lstrip("q"))
+                except ValueError:
+                    continue
+                total_by_q[q_idx] = total_by_q.get(q_idx, 0) + 1
+                q = quiz_data["questions"][q_idx] if q_idx < len(quiz_data["questions"]) else None
+                if q and not is_correct(ans, q.get("correct_option_id")):
+                    wrong_by_q[q_idx] = wrong_by_q.get(q_idx, 0) + 1
+                    mistakes.append({"qid": qid, "index": q_idx})
+            if mistakes:
+                await mistake_repo.record(user_id, mistakes)
+
+        if total_by_q:
+            await stats_repo.bulk_update_wrong_stats(
+                qid, [{"index": i, "wrong": wrong_by_q.get(i, 0), "total": n} for i, n in total_by_q.items()]
+            )
+        await quiz_repo.increment_participants(qid)
+
+    chat_settings_repo = ChatSettingsRepository(db)
+    chat_settings = await chat_settings_repo.get(chat_id)
+
+    if chat_settings["html_enabled"]:
         try:
-            if kind == "c":
-                for nm in names:
-                    items.append({"title": nm, "sections": []})
-                i = len(items) - 1
-                screen = lambda: coaching_screen(i, True)
-            elif kind == "sec":
-                i = pending[1]
-                for nm in names:
-                    items[i]["sections"].append({"title": nm, "subs": []})
-                j = len(items[i]["sections"]) - 1
-                screen = lambda: section_screen(i, j, True)
-            elif kind == "sub":
-                i, j = pending[1], pending[2]
-                for nm in names:
-                    items[i]["sections"][j]["subs"].append({"title": nm, "files": []})
-                screen = lambda: section_screen(i, j, True)
-            else:  # rename
-                level = pending[1]
-                if level == "c":
-                    i = pending[2]
-                    items[i]["title"] = name
-                    screen = lambda: coaching_screen(i, True)
-                elif level == "sec":
-                    i, j = pending[2], pending[3]
-                    items[i]["sections"][j]["title"] = name
-                    screen = lambda: section_screen(i, j, True)
-                else:
-                    i, j, k = pending[2], pending[3], pending[4]
-                    items[i]["sections"][j]["subs"][k]["title"] = name
-                    screen = lambda: sub_screen(i, j, k, True)
-        except (IndexError, KeyError):
-            context.user_data.pop("pending", None)
-            await msg.reply_text("Ye item ab available nahi hai. /start karo.")
-            return
-        save(items)
-        context.user_data.pop("pending")
-        text, kb = screen()
-        await msg.reply_text("✅ Ho gaya.\n\n" + text, reply_markup=kb, parse_mode=HTML)
+            report_quiz = {**quiz_data, "qid": qid}
+            html_bytes, filename = await render_quiz_html(report_quiz, mode="exam")
+            await ctx.bot.send_document(
+                chat_id=chat_id, document=html_bytes, filename=filename,
+                caption="\U0001F4C4 Interactive quiz report",
+                **({"message_thread_id": thread_id} if thread_id else {}),
+            )
+        except Exception as e:
+            logger.error("HTML report generation error: %s", e)
 
-    elif kind == "f":
-        doc = msg.document
-        fname = (doc.file_name or "").lower() if doc else ""
-        if not doc or not fname.endswith((".html", ".htm", ".pdf")):
-            await msg.reply_text("Sirf .html ya .pdf file bhejo (khatam karne ke liye /done).")
-            return
-        i, j, k = pending[1], pending[2], pending[3]
+    if chat_settings["pdf_enabled"]:
+        await _send_pdf_report(ctx, chat_id, quiz_data, chat_title, leaderboard, session_polls=None, thread_id=thread_id)
+
+
+async def _send_pdf_report(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz_data: dict, chat_title: str,
+    leaderboard: list[dict], session_polls: Optional[dict], thread_id: Optional[int],
+) -> None:
+    """Render and send a PDF quiz report, offloading WeasyPrint's
+    synchronous rendering to a thread-pool executor."""
+    try:
+        orig_questions = quiz_data.get("questions", [])
+        neg_val = quiz_data.get("negative_marking", 0)
+        cm_val = quiz_data.get("correct_mark", 1)
+        sections = quiz_data.get("sections", [])
+        do_shuffle_opts = quiz_data.get("shuffle_options", False)
+
+        real_polls = session_polls or {}
+        sent_indices = {pdata.get("question_index") for pdata in real_polls.values()}
+        full_polls = dict(real_polls)
+        for q_idx in range(len(orig_questions)):
+            if q_idx not in sent_indices:
+                full_polls[f"__unsent_{q_idx}__"] = {"question_index": q_idx, "correct_option": [], "sent_time": 0}
+
+        bg_image_b64 = None
         try:
-            files = items[i]["sections"][j]["subs"][k]["files"]
-        except (IndexError, KeyError):
-            context.user_data.pop("pending", None)
-            await msg.reply_text("Ye item ab available nahi hai. /start karo.")
-            return
-        if fname.endswith(".pdf"):
-            new_files, note = [{"file_id": doc.file_id, "name": doc.file_name}], "📕 PDF as-is save ki."
-        else:
-            new_files, note = await make_test_file(context, msg.chat_id, doc)
-        files.extend(new_files)
-        save(items)
-        await msg.reply_text(
-            f"✅ <b>{h(new_files[0]['name'])}</b> add ho gayi (total {len(files)} files).\n{note}\n"
-            "Aur bhejo ya /done dabao.",
-            parse_mode=HTML,
+            chat_obj = await ctx.bot.get_chat(chat_id)
+            if getattr(chat_obj, "photo", None):
+                photo_file = await ctx.bot.get_file(chat_obj.photo.small_file_id)
+                photo_bytes = await photo_file.download_as_bytearray()
+                bg_image_b64 = "data:image/jpeg;base64," + base64.b64encode(bytes(photo_bytes)).decode()
+        except Exception:
+            pass
+
+        pdf_path = os.path.join(tempfile.gettempdir(), f"quiz_report_{chat_id}_{int(time.time())}.pdf")
+        quiz_name = quiz_data.get("quiz_name", "Unnamed Quiz")
+
+        loop = asyncio.get_running_loop()
+        pdf_ok = await loop.run_in_executor(
+            None, render_quiz_pdf, quiz_name, chat_title, orig_questions, leaderboard,
+            full_polls, neg_val, cm_val, pdf_path, sections, bg_image_b64, do_shuffle_opts, "classic",
         )
 
+        if pdf_ok and os.path.exists(pdf_path):
+            try:
+                caption = (
+                    f"\U0001F4C4 <b>{quiz_name}</b>\n\U0001F4DA {chat_title}\n"
+                    f"\U0001F465 {len(leaderboard)} participant(s)\n\n"
+                    f"<i>Full quiz report with questions, answers &amp; results</i>"
+                )
+                with open(pdf_path, "rb") as pf:
+                    await ctx.bot.send_document(
+                        chat_id=chat_id, document=pf, filename=f"QuizReport_{quiz_name[:30]}.pdf",
+                        caption=caption, parse_mode=ParseMode.HTML,
+                        **({"message_thread_id": thread_id} if thread_id else {}),
+                    )
+            finally:
+                try:
+                    os.remove(pdf_path)
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.error("PDF report error: %s", e, exc_info=True)
 
-def main():
-    if not BOT_TOKEN or BOT_TOKEN.startswith("PASTE_"):
-        raise SystemExit("BOT_TOKEN nahi mila. .env file me BOT_TOKEN=apna_token likho (BotFather se milta hai).")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("id", my_id))
-    app.add_handler(CommandHandler("done", done))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), on_message))
-    print("Bot chal raha hai…")
-    app.run_polling()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start [quiz_id] [skip] -- launches the quiz-setup wizard, or shows a
+    welcome message if no quiz id was given."""
+    from .setup_wizard import show_correct_mark_prompt
+    from ..state import pending_quiz_settings
+
+    chat_id = update.message.chat_id
+    try:
+        chat_type = update.message.chat.type
+        is_anon = _is_anon_admin(update.message)
+
+        if is_anon and chat_type != ChatType.PRIVATE:
+            qid_arg = ctx.args[0] if ctx.args else ""
+            btn = InlineKeyboardMarkup([[
+                InlineKeyboardButton("\U0001F464 Tap here to verify your identity", callback_data=f"qs_anon_verify_{chat_id}_{qid_arg}")
+            ]])
+            await safe_send_message(
+                ctx, chat_id,
+                "⚠️ <b>Anonymous admin detected!</b>\n\nTap the button below to verify and continue.",
+                parse_mode=ParseMode.HTML, reply_markup=btn,
+            )
+            return
+
+        user_id = update.message.from_user.id
+
+        # Enforce channel membership for every private /start entry, including
+        # personal quiz deep-links. Keep the original payload so Retry reopens
+        # the exact same quiz (rather than sending the user to a generic start).
+        if chat_type == ChatType.PRIVATE:
+            start_payload = ctx.args[0] if ctx.args else "home"
+            try:
+                if not await _force_subscribed(ctx, user_id):
+                    await _send_force_sub_prompt(ctx, chat_id, start_payload)
+                    return
+            except Exception as sub_exc:
+                logger.warning("Force-subscription check failed for user %s: %s", user_id, sub_exc)
+                await _send_force_sub_prompt(ctx, chat_id, start_payload)
+                return
+
+        if not await is_premium_user(user_id):
+            await safe_send_message(ctx, chat_id, "Please help us to make this project more valuable by purchasing premium! Thanks")
+            return
+        if not await rate_limiter.check(user_id):
+            await safe_send_message(ctx, chat_id, "⏱️ Too many requests. Wait a moment.")
+            return
+
+        if not ctx.args or ctx.args[0] == "home":
+            welcome = (
+                "\U0001F44B Welcome to <b>Advance Quiz Bot</b>!\n\n"
+                "Create quizzes with MCQs, sections, timers, and more.\n\n"
+                "Use /help to learn usage!"
+            )
+            await safe_send_message(ctx, chat_id, welcome, parse_mode=ParseMode.HTML)
+            return
+
+        qid = ctx.args[0]
+        skip = int(ctx.args[1]) if len(ctx.args) > 1 and ctx.args[1].isdigit() else 0
+
+        # The inline-share "Play Quiz" button opens `?startapp=play_<qid>_
+        # <mode>` (see mini_app_link.py's _startapp_payload) so it can work
+        # from a context where a native web_app button isn't allowed. When
+        # the Mini App is registered with BotFather, Telegram launches it
+        # directly and this handler never runs. But if the Mini App isn't
+        # registered yet, or the user's client doesn't support Mini Apps,
+        # Telegram falls back to a plain `/start play_<qid>_<mode>` command
+        # here instead -- and without unwrapping that payload first, `qid`
+        # would literally be the string "play_<qid>_<mode>", which never
+        # matches a real quiz id, so every fallback used to fail with
+        # "Invalid QuestionSetID." Detect and unwrap it, then hand the user
+        # a working native Play button (safe here since /start is always a
+        # private chat) instead of silently erroring out.
+        mini_app_mode: Optional[str] = None
+        if qid.startswith("play_") and "_" in qid[len("play_"):]:
+            body = qid[len("play_"):]
+            real_qid, _, mode_part = body.rpartition("_")
+            if real_qid and mode_part in ("practice", "exam"):
+                qid = real_qid
+                mini_app_mode = mode_part
+
+        if session_mgr.get(chat_id):
+            await safe_send_message(ctx, chat_id, "⚠️ A quiz is already running. /stop it first.")
+            return
+
+        quiz_repo = QuizRepository(get_db())
+        quiz = await quiz_repo.get(qid)
+        if not quiz:
+            if mini_app_mode:
+                await safe_send_message(
+                    ctx, chat_id,
+                    "❌ This quiz link has expired or the quiz was removed.",
+                )
+            else:
+                await safe_send_message(ctx, chat_id, "❌ Invalid QuestionSetID.")
+            return
+
+        if mini_app_mode and chat_type == ChatType.PRIVATE:
+            # The Mini App WebApp launch didn't happen (not registered with
+            # BotFather yet, or an older client) -- offer a real native
+            # web_app button here instead of silently starting the classic
+            # poll-based quiz the user didn't ask for.
+            label = "\U0001F3AF Play (Practice)" if mini_app_mode == "practice" else "\U0001F4DD Play (Exam)"
+            play_btn = mini_app_web_app_button_ptb(qid, mini_app_mode, label)
+            if play_btn:
+                await safe_send_message(
+                    ctx, chat_id,
+                    f"✨ <b>{quiz.get('quiz_name', 'Quiz')}</b>\n\nTap below to play:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[play_btn]]),
+                )
+                return
+            # Mini App isn't configured at all (no MINI_APP_DOMAIN) --
+            # fall through to the classic poll-based quiz below so the
+            # link still does *something* useful instead of a dead end.
+
+        allowed, batch = await resolve_quiz_access(qid, quiz, chat_id, chat_type, user_id, ctx=ctx)
+        if not allowed:
+            await _send_access_denied(ctx, chat_id, quiz, batch)
+            return
+
+        # Content protection (forward/save block) defaults to ON for every
+        # quiz -- free or paid -- and is only lifted when the creator is
+        # running their own quiz in their own private chat. Matches the
+        # original bot's `protect = True; if chat_id == creator_id and
+        # chat_type == "private": protect = False` logic exactly.
+        protect = not (chat_id == quiz.get("creator_id") and chat_type == "private")
+
+        quiz["question_set_id"] = quiz["qid"]
+        quiz["negative_marking"] = quiz.get("negative_marks", 0)
+        quiz["correct_mark"] = quiz.get("correct_marks", 1)
+        quiz["shuffle_options"] = bool(quiz.get("shuffle_options", False))
+        quiz["shuffle"] = bool(quiz.get("shuffle_questions", False))
+
+        cmd_thread_id = getattr(update.message, "message_thread_id", None)
+        pending_quiz_settings[chat_id] = {
+            "quiz": quiz, "update": update, "skip": skip,
+            "protect": protect, "chat_type": chat_type,
+            "correct_mark": 1.0, "neg_mark": 0.0,
+            "shuffle_q": False, "shuffle_o": False,
+            "show_explanation": False, "timer_override": None,
+            "initiator_id": user_id, "message_thread_id": cmd_thread_id,
+        }
+
+        # Offer the visual Mini App player as an alternative to the classic
+        # poll-based flow -- private chats only (web_app buttons aren't
+        # valid in groups), doesn't touch pending_quiz_settings/the wizard
+        # below at all, just an extra informational message. Silently
+        # skipped if MINI_APP_DOMAIN isn't configured.
+        if chat_type == ChatType.PRIVATE:
+            play_practice = mini_app_web_app_button_ptb(qid, "practice", "\U0001F3AF Play (Practice)")
+            play_exam = mini_app_web_app_button_ptb(qid, "exam", "\U0001F4DD Play (Exam)")
+            if play_practice and play_exam:
+                await safe_send_message(
+                    ctx, chat_id,
+                    "✨ You can also play this quiz visually in-app:",
+                    reply_markup=InlineKeyboardMarkup([[play_practice, play_exam]]),
+                )
+
+        await show_correct_mark_prompt(ctx, chat_id)
+    except Exception as e:
+        logger.error("start_quiz error: %s", e, exc_info=True)
+        await safe_send_message(ctx, chat_id, "❌ Error starting quiz.")
 
 
-if __name__ == "__main__":
-    main()
+async def _send_access_denied(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz: dict, batch: Optional[dict]) -> None:
+    creator_id = quiz.get("creator_id")
+    if batch:
+        msg = f"\U0001F512 <b>Paid Quiz — Access Required</b>\n\n\U0001F4E6 Batch: <b>{batch.get('name', '')}</b>\n"
+        if batch.get("description"):
+            msg += f"\U0001F4DD {batch['description']}\n"
+        if batch.get("payment_link"):
+            msg += f"\n\U0001F4B3 <b>Pay here:</b> {batch['payment_link']}\n"
+        if batch.get("contact_info"):
+            msg += f"\U0001F4DE <b>Contact:</b> {batch['contact_info']}\n"
+        msg += "\nAfter payment, send screenshot to the contact above."
+        await safe_send_message(ctx, chat_id, msg, parse_mode=ParseMode.HTML)
+    else:
+        try:
+            cinfo = await ctx.bot.get_chat(creator_id)
+            details = f"\U0001F464 {cinfo.first_name or ''}\n\U0001F4AC @{cinfo.username or 'N/A'}\n\U0001F522 ID: {cinfo.id}"
+            await safe_send_message(ctx, chat_id, f"❌ Contact the quiz creator for access.\n\n{details}")
+        except Exception:
+            await safe_send_message(ctx, chat_id, f"❌ Contact creator ID {creator_id} for access.")
+
+
+async def stop_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop -- ends the running quiz in this chat (admin-only in groups)."""
+    chat_id = update.message.chat.id
+    try:
+        chat_type = update.message.chat.type
+        is_anon = _is_anon_admin(update.message)
+        user_id = None if is_anon else (update.message.from_user.id if update.message.from_user else None)
+
+        session = session_mgr.get(chat_id)
+        if not session:
+            await safe_send_message(ctx, chat_id, "⚠️ No quiz running.")
+            return
+
+        if chat_type == ChatType.PRIVATE:
+            tasks.cancel_all_for_chat(chat_id)
+            if session.get("is_private"):
+                await end_private_quiz(chat_id, ctx)
+            else:
+                await end_quiz(update, ctx, session["quiz_id"], True)
+            await session_mgr.delete(chat_id)
+            await safe_send_message(ctx, chat_id, "\U0001F6AB Quiz stopped.")
+            return
+
+        if not await _require_admin(ctx, chat_id, user_id, is_anon):
+            await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
+            return
+
+        tasks.cancel_all_for_chat(chat_id)
+        qid = session["quiz_id"]
+        try:
+            await end_quiz(update, ctx, qid, True)
+        finally:
+            await session_mgr.delete(chat_id)
+            await safe_send_message(ctx, chat_id, "\U0001F6AB Quiz stopped by admin.")
+    except Exception as e:
+        logger.error("stop_quiz error: %s", e, exc_info=True)
+
+
+async def pause_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pause -- pauses the running quiz (admin-only in groups)."""
+    chat_id = update.message.chat.id
+    try:
+        chat_type = update.message.chat.type
+        is_anon = _is_anon_admin(update.message)
+        user_id = None if is_anon else (update.message.from_user.id if update.message.from_user else None)
+
+        session = session_mgr.get(chat_id)
+        if not session:
+            await safe_send_message(ctx, chat_id, "⚠️ No quiz running.")
+            return
+
+        if chat_type != ChatType.PRIVATE and not await _require_admin(ctx, chat_id, user_id, is_anon):
+            await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
+            return
+
+        await session_mgr.update(chat_id, {"paused": True})
+        who = "" if chat_type == ChatType.PRIVATE else " by admin"
+        await safe_send_message(ctx, chat_id, f"⏸ Paused{who}. /resume to continue.")
+    except Exception as e:
+        logger.error("pause_quiz error: %s", e)
+
+
+async def resume_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/resume -- resumes a paused quiz (admin-only in groups)."""
+    chat_id = update.message.chat.id
+    try:
+        chat_type = update.message.chat.type
+        is_anon = _is_anon_admin(update.message)
+        user_id = None if is_anon else (update.message.from_user.id if update.message.from_user else None)
+
+        session = session_mgr.get(chat_id)
+        if not session or not session.get("paused"):
+            await safe_send_message(ctx, chat_id, "⚠️ No quiz paused.")
+            return
+
+        if chat_type != ChatType.PRIVATE and not await _require_admin(ctx, chat_id, user_id, is_anon):
+            await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
+            return
+
+        await session_mgr.update(chat_id, {"paused": False})
+        who = "" if chat_type == ChatType.PRIVATE else " by admin"
+        await safe_send_message(ctx, chat_id, f"▶️ Resumed{who}!")
+
+        if chat_type == ChatType.PRIVATE and session.get("is_private") and session.get("waiting_for_answer"):
+            cur = session.get("current_index", 0)
+            if cur < len(session.get("questions", [])):
+                await send_private_question(chat_id, ctx, cur)
+    except Exception as e:
+        logger.error("resume_quiz error: %s", e)
+
+
+async def _adjust_timer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, delta: int) -> None:
+    chat_id = update.message.chat.id
+    chat_type = update.message.chat.type
+    is_anon = _is_anon_admin(update.message)
+    user_id = None if is_anon else (update.message.from_user.id if update.message.from_user else None)
+
+    seconds = abs(delta)
+    if ctx.args and ctx.args[0].isdigit():
+        seconds = int(ctx.args[0])
+    if delta < 0:
+        seconds = -seconds
+
+    session = session_mgr.get(chat_id)
+    if not session:
+        await safe_send_message(ctx, chat_id, "⚠️ No quiz running.")
+        return
+
+    if chat_type != ChatType.PRIVATE and not await _require_admin(ctx, chat_id, user_id, is_anon):
+        await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
+        return
+
+    offset = session.get("modified_timer_offset", 0) + seconds
+    await session_mgr.update(chat_id, {"modified_timer_offset": offset})
+    direction = "decreased" if seconds < 0 else "increased"
+    await safe_send_message(ctx, chat_id, f"⏱️ Timer {direction} by {abs(seconds)}s per question.")
+
+
+async def fast_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/fast -- shortens the remaining per-question timer by 5s (or a given amount)."""
+    try:
+        await _adjust_timer(update, ctx, -5)
+    except Exception as e:
+        logger.error("fast_quiz error: %s", e)
+
+
+async def slow_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/slow -- lengthens the remaining per-question timer by 5s (or a given amount)."""
+    try:
+        await _adjust_timer(update, ctx, 5)
+    except Exception as e:
+        logger.error("slow_quiz error: %s", e)
+
+
+async def normal_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/normal -- resets the per-question timer offset to zero."""
+    chat_id = update.message.chat.id
+    try:
+        chat_type = update.message.chat.type
+        is_anon = _is_anon_admin(update.message)
+        user_id = None if is_anon else (update.message.from_user.id if update.message.from_user else None)
+
+        session = session_mgr.get(chat_id)
+        if not session:
+            await safe_send_message(ctx, chat_id, "⚠️ No quiz running.")
+            return
+        if chat_type != ChatType.PRIVATE and not await _require_admin(ctx, chat_id, user_id, is_anon):
+            await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
+            return
+
+        await session_mgr.update(chat_id, {"modified_timer_offset": 0})
+        await safe_send_message(ctx, chat_id, "⏱️ Timer reset to default.")
+    except Exception as e:
+        logger.error("normal_quiz error: %s", e)
+
+
+async def leaderboard_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/leaderboard -- shows a live top-10 leaderboard for the running quiz."""
+    try:
+        chat_id = update.message.chat.id
+        user_id = update.message.from_user.id
+        chat_type = update.message.chat.type
+
+        session = session_mgr.get(chat_id)
+        if not session:
+            await safe_send_message(ctx, chat_id, "⚠️ No quiz running.")
+            return
+
+        if chat_type != ChatType.PRIVATE:
+            try:
+                member = await ctx.bot.get_chat_member(chat_id, user_id)
+                if member.status not in ("administrator", "creator"):
+                    await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
+                    return
+            except Exception:
+                return
+
+        total = len(session.get("quiz_data", {}).get("questions", []))
+        done = session.get("current_index", 0)
+        await _send_mid_quiz_leaderboard(chat_id, ctx, done, total)
+    except Exception as e:
+        logger.error("leaderboard_command error: %s", e)
+
+
+async def handle_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """PollAnswerHandler: routes an incoming answer to the matching private
+    or group session, records it, and runs anti-cheat detection for groups
+    that opted in."""
+    try:
+        pa = update.poll_answer
+        poll_id = pa.poll_id
+        user_id = pa.user.id
+        user_name = pa.user.first_name
+        option_ids = list(pa.option_ids)
+        now = time.time()
+
+        for cid in list(session_mgr.sessions.keys()):
+            s = session_mgr.get(cid)
+            if s and s.get("is_private") and poll_id == s.get("active_poll_id"):
+                if not option_ids:
+                    if user_id in s.get("participants", {}):
+                        s["participants"][user_id]["answers"].pop(poll_id, None)
+                        await session_mgr.update(cid, s)
+                    return
+                await handle_private_poll_answer(poll_id, user_id, option_ids, now)
+                return
+
+        for cid in list(session_mgr.sessions.keys()):
+            s = session_mgr.get(cid)
+            if not s or s.get("is_private"):
+                continue
+            if poll_id not in s.get("polls", {}):
+                continue
+
+            if not option_ids:
+                if user_id in s.get("participants", {}):
+                    s["participants"][user_id]["answers"].pop(poll_id, None)
+                    await session_mgr.update(cid, s)
+                return
+
+            correct = s["polls"][poll_id].get("correct_option")
+            is_multi_poll = isinstance(correct, list) and len(correct) > 1
+
+            if user_id not in s["participants"]:
+                s["participants"][user_id] = {"name": user_name, "answers": {}}
+            s["participants"][user_id]["answers"][poll_id] = {"option": option_ids, "time": now, "is_multi": is_multi_poll}
+            await session_mgr.update(cid, s)
+
+            if s.get("anti_cheat"):
+                await _check_anti_cheat(ctx, cid, s, poll_id, user_id, user_name, option_ids, correct, now)
+            return
+    except Exception as e:
+        logger.error("handle_poll_answer error: %s", e, exc_info=True)
+
+
+async def _check_anti_cheat(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, session: dict, poll_id: str,
+    user_id: int, user_name: str, option_ids: list, correct: Any, now: float,
+) -> None:
+    """Speed+accuracy pattern check: users who repeatedly answer faster than
+    config.CHEAT_SPEED_THRESHOLD *and* get it wrong are flagged as likely
+    running a duplicate/bot account and auto-kicked past a suspicion ratio."""
+    pinfo = session["polls"][poll_id]
+    sent_time = pinfo.get("sent_time", now)
+    answer_time = now - sent_time
+    correct_answer = is_correct(option_ids, correct)
+    fast_and_wrong = answer_time < config.CHEAT_SPEED_THRESHOLD and not correct_answer
+
+    p_entry = session["participants"][user_id]
+    ct = p_entry.setdefault("cheat_track", {"suspicious": 0, "total": 0})
+    ct["total"] += 1
+    if fast_and_wrong:
+        ct["suspicious"] += 1
+    await session_mgr.update(chat_id, session)
+
+    if ct["total"] % CHEAT_CHECK_EVERY != 0:
+        return
+    sus_ratio = ct["suspicious"] / ct["total"]
+    if sus_ratio < CHEAT_WRONG_RATIO:
+        return
+    try:
+        await ctx.bot.ban_chat_member(chat_id, user_id)
+        await safe_send_message(
+            ctx, chat_id,
+            f"\U0001F6AB <b>{user_name}</b> was removed from the group!\n\n"
+            f"<i>Suspicious rapid-wrong-answer pattern detected (possible duplicate account).</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.warning("Cheater kicked: uid=%s name=%s cid=%s suspicious=%.0f%%", user_id, user_name, chat_id, sus_ratio * 100)
+    except Exception as e:
+        logger.error("Failed to kick cheater uid=%s: %s", user_id, e)
+
+
+def register(application: Application) -> None:
+    """Register all quiz-play command/poll handlers on the given Application."""
+    application.add_handler(CommandHandler("start", start_quiz))
+    application.add_handler(CommandHandler("pause", pause_quiz))
+    application.add_handler(CommandHandler("resume", resume_quiz))
+    application.add_handler(CommandHandler("stop", stop_quiz))
+    application.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    application.add_handler(CommandHandler("slow", slow_quiz))
+    application.add_handler(CommandHandler("fast", fast_quiz))
+    application.add_handler(CommandHandler("normal", normal_quiz))
+    application.add_handler(PollAnswerHandler(handle_poll_answer))
