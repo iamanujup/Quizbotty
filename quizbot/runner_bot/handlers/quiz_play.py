@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 async def _force_subscribed(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Check whether a private-chat user joined the required public channel."""
-    channel = (config.REQUIRED_SUB_CHANNEL or "MOCKMARG").strip()
+    channel = (config.REQUIRED_SUB_CHANNEL or "SADHNAAMARG").strip()
     if not channel:
         return True
     if not channel.startswith("@") and not channel.lstrip("-").isdigit():
@@ -77,8 +77,8 @@ async def _send_force_sub_prompt(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, payload: str = "home"
 ) -> None:
     """Show join + retry buttons; retry reopens the same /start payload."""
-    channel = (config.REQUIRED_SUB_CHANNEL or "MOCKMARG").strip().lstrip("@")
-    retry_url = f"https://t.me/MOCKMARGBOT?start={payload or 'home'}"
+    channel = (config.REQUIRED_SUB_CHANNEL or "SADHNAAMARG").strip().lstrip("@")
+    retry_url = f"https://t.me/MOCKMARGJUBOT?start={payload or 'home'}"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 JOIN CHANNEL", url=f"https://t.me/{channel}")],
         [InlineKeyboardButton("🔄 RETRY / VERIFY", url=retry_url)],
