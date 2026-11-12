@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 async def _force_subscribed(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Check whether a private-chat user joined the required public channel."""
-    channel = (config.REQUIRED_SUB_CHANNEL or "SADHNAAMARG").strip()
+    channel = (config.REQUIRED_SUB_CHANNEL or "MOCKMARG").strip()
     if not channel:
         return True
     if not channel.startswith("@") and not channel.lstrip("-").isdigit():
@@ -77,8 +77,8 @@ async def _send_force_sub_prompt(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, payload: str = "home"
 ) -> None:
     """Show join + retry buttons; retry reopens the same /start payload."""
-    channel = (config.REQUIRED_SUB_CHANNEL or "SADHNAAMARG").strip().lstrip("@")
-    retry_url = f"https://t.me/MOCKMARGJUBOT?start={payload or 'home'}"
+    channel = (config.REQUIRED_SUB_CHANNEL or "MOCKMARG").strip().lstrip("@")
+    retry_url = f"https://t.me/MOCKMARGBOT?start={payload or 'home'}"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 JOIN CHANNEL", url=f"https://t.me/{channel}")],
         [InlineKeyboardButton("🔄 RETRY / VERIFY", url=retry_url)],
@@ -1103,6 +1103,25 @@ async def end_quiz(update: Any, ctx: ContextTypes.DEFAULT_TYPE, quiz_id: str, pr
                 lambda text: safe_send_message(ctx, chat_id, text, **msg_kwargs),
                 chat_id, rich_md, thread_id=end_tid,
             )
+
+        # Show a direct "Start in DM" button immediately below the group result.
+        # Telegram deep-links open this exact quiz in the bot's private chat.
+        try:
+            bot_info = await ctx.bot.get_me()
+            if bot_info.username:
+                dm_url = f"https://t.me/{bot_info.username}?start={quiz_id}"
+                dm_keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🚀 START QUIZ IN DM", url=dm_url)
+                ]])
+                await safe_send_message(
+                    ctx, chat_id,
+                    "👇 <b>Quiz को दोबारा अपने DM में शुरू करें:</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=dm_keyboard,
+                    **msg_kwargs,
+                )
+        except Exception as button_error:
+            logger.warning("Could not send group result DM restart button: %s", button_error)
 
         await _record_attempt_and_report(
             ctx, chat_id, quiz_data, leaderboard, chat_title=chat_title,
