@@ -1,8 +1,5 @@
 """
-Advance Quiz Bot — Open Source Project
-This project was originally developed by Gagan (github.com/devgaganin).
-Reference: https://t.me/advance_quiz_bot
-The codebase has been reviewed and verified with the assistance of Claude AI.
+Advance Quiz Bot — Channel Subscription Verification
 """
 
 from __future__ import annotations
@@ -11,7 +8,11 @@ import logging
 
 from pyrogram import Client
 from pyrogram.errors import UserNotParticipant
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from quizbot.shared import config
 
@@ -21,33 +22,92 @@ _JOIN_PROMPT_PHOTO = "https://graph.org/file/d44f024a08ded19452152.jpg"
 
 
 async def subscribe_gate(app: Client, m: Message) -> bool:
-    """Return True (and reply with a block/prompt message) if the command
-    should be BLOCKED -- i.e. the user is banned from `LOG_GROUP`, or not a
-    member of `REQUIRED_SUB_CHANNEL`. Returns False if the command may
-    proceed. Callers should `return` immediately when this returns True:
-
-        if await subscribe_gate(app, m):
-            return
     """
-    if not config.LOG_GROUP:
-        return False
-    try:
-        member = await app.get_chat_member(config.LOG_GROUP, m.from_user.id)
-        if str(member.status) == "ChatMemberStatus.BANNED":
-            await m.reply_text("\U0001F6AB Banned")
-            return True
-    except UserNotParticipant:
-        if config.REQUIRED_SUB_CHANNEL:
-            await m.reply_photo(
-                _JOIN_PROMPT_PHOTO,
-                caption="\U0001F4E2 Please join our channel to continue.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("\U0001F517 Join", url=f"https://t.me/{config.REQUIRED_SUB_CHANNEL}")]]
-                ),
+    Block command if user is banned from LOG_GROUP
+    or is not a member of REQUIRED_SUB_CHANNEL.
+    """
+
+    user_id = m.from_user.id
+
+    # 1. Check whether user is banned from LOG_GROUP.
+    if config.LOG_GROUP:
+        try:
+            member = await app.get_chat_member(
+                config.LOG_GROUP,
+                user_id,
             )
-            return True
+
+            status = str(member.status).lower()
+
+            if "banned" in status:
+                await m.reply_text("🚫 Banned")
+                return True
+
+        except UserNotParticipant:
+            # Not being in LOG_GROUP does not mean
+            # the user has not joined the required channel.
+            pass
+
+        except Exception as exc:
+            logger.warning(
+                "LOG_GROUP membership check failed: %s",
+                exc,
+            )
+
+    # 2. Check REQUIRED_SUB_CHANNEL separately.
+    if not config.REQUIRED_SUB_CHANNEL:
         return False
+
+    channel = config.REQUIRED_SUB_CHANNEL.strip()
+
+    try:
+        member = await app.get_chat_member(
+            channel,
+            user_id,
+        )
+
+        status = str(member.status).lower()
+
+        is_member = (
+            "member" in status
+            or "administrator" in status
+            or "owner" in status
+        )
+
+        if "restricted" in status:
+            is_member = bool(
+                getattr(member, "is_member", False)
+            )
+
+        if is_member:
+            return False
+
+    except UserNotParticipant:
+        pass
+
     except Exception as exc:
-        logger.debug("subscribe_gate check failed (allowing through): %s", exc)
+        logger.exception(
+            "Required channel membership check failed: %s",
+            exc,
+        )
         return False
-    return False
+
+    # 3. User has not joined the required channel.
+    join_channel = channel.lstrip("@")
+
+    await m.reply_photo(
+        _JOIN_PROMPT_PHOTO,
+        caption="📢 Please join our channel to continue.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔗 Join",
+                        url=f"https://t.me/{join_channel}",
+                    )
+                ]
+            ]
+        ),
+    )
+
+    return True
