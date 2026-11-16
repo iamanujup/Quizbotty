@@ -20,7 +20,6 @@ from .state import pending_quiz_settings, session_mgr
 
 logger = logging.getLogger(__name__)
 
-# Telegram API hard limits.
 TG_QUESTION_MAX = 295
 TG_OPTION_MAX = 100
 TG_EXPLANATION_MAX = 200
@@ -56,7 +55,7 @@ def _get_topic_thread_id(chat_id: int) -> Optional[int]:
 async def safe_send_message(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, **kwargs: Any
 ) -> Optional[Any]:
-    """Send a message with retry on flood-control/timeout/network errors."""
+    """Send a message with retry on errors."""
 
     if "message_thread_id" not in kwargs:
         tid = _get_topic_thread_id(chat_id)
@@ -66,20 +65,13 @@ async def safe_send_message(
     for attempt in range(MAX_RETRIES):
         try:
             return await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                **kwargs
+                chat_id=chat_id, text=text, **kwargs
             )
 
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + random.uniform(0.5, 2.0))
 
-        except TimedOut:
-            await asyncio.sleep(
-                RETRY_BASE_DELAY * (2 ** attempt) + random.random()
-            )
-
-        except NetworkError:
+        except (TimedOut, NetworkError):
             await asyncio.sleep(
                 RETRY_BASE_DELAY * (2 ** attempt) + random.random()
             )
@@ -89,23 +81,15 @@ async def safe_send_message(
             return None
 
         except TelegramError as e:
-            if (
-                "chat not found" in str(e).lower()
-                or "bot was blocked" in str(e).lower()
-            ):
+            if "chat not found" in str(e).lower() or "bot was blocked" in str(e).lower():
                 return None
-
             await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
         except Exception as e:
             logger.error("Unexpected send error: %s", e)
             return None
 
-    logger.error(
-        "Failed to send message to %s after %d retries",
-        chat_id,
-        MAX_RETRIES
-    )
+    logger.error("Failed to send message to %s after %d retries", chat_id, MAX_RETRIES)
     return None
 
 
@@ -116,7 +100,7 @@ async def safe_send_poll(
     options: list[str],
     **kwargs: Any
 ) -> Optional[Any]:
-    """Send a poll with retry on flood-control/timeout/network errors."""
+    """Send a poll with retry on errors."""
 
     if "message_thread_id" not in kwargs:
         tid = _get_topic_thread_id(chat_id)
@@ -135,12 +119,7 @@ async def safe_send_poll(
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + random.uniform(1.0, 3.0))
 
-        except TimedOut:
-            await asyncio.sleep(
-                RETRY_BASE_DELAY * (2 ** attempt) + random.random()
-            )
-
-        except NetworkError:
+        except (TimedOut, NetworkError):
             await asyncio.sleep(
                 RETRY_BASE_DELAY * (2 ** attempt) + random.random()
             )
@@ -172,11 +151,7 @@ async def safe_send_poll(
             logger.error("Unexpected poll error: %s", e)
             return None
 
-    logger.error(
-        "Failed to send poll to %s after %d retries",
-        chat_id,
-        MAX_RETRIES
-    )
+    logger.error("Failed to send poll to %s after %d retries", chat_id, MAX_RETRIES)
     return None
 
 
@@ -199,13 +174,12 @@ def prepare_poll_data(
     total_questions: int,
 ) -> tuple[str, list[str], Optional[str], Optional[str], Optional[str]]:
     """
-    Prepare question and options for Telegram Quiz Poll.
+    Prepare Telegram Quiz Poll.
 
-    IMPORTANT:
-    - Every option retains its original text.
-    - No automatic Option A / Option B replacement.
-    - Each option is individually truncated to Telegram's 100-character limit.
-    - Full long options are included in the description.
+    1. Actual question appears in poll title.
+    2. Original option text is retained.
+    3. Explanation and examples appear in bulb.
+    4. Full content is retained in description/overflow.
     """
 
     prefix = f"[{question_index + 1}/{total_questions}] "
@@ -222,12 +196,14 @@ def prepare_poll_data(
         full_body = question_text.strip()
 
     else:
-        poll_stem = question_text
-        full_body = question_text
+        poll_stem = question_text.strip()
+        full_body = question_text.strip()
 
-    full_question = f"{prefix}{poll_stem}"
-
-    question_too_long = len(full_question) > QUESTION_SOFT_LIMIT
+    # ACTUAL QUESTION instead of "Choose the correct option"
+    poll_question = _truncate(
+        f"{prefix}{poll_stem}",
+        TG_QUESTION_MAX
+    )
 
     any_option_long = any(
         len(str(opt)) > OPTION_SOFT_LIMIT
@@ -236,50 +212,41 @@ def prepare_poll_data(
 
     needs_overflow = (
         is_multiline
-        or question_too_long
         or any_option_long
+        or len(prefix + poll_stem) > QUESTION_SOFT_LIMIT
     )
 
-    if question_too_long or is_multiline:
-        poll_question = f"{prefix}Choose the correct option"
-    else:
-        poll_question = full_question
+    # Preserve original option text.
+    poll_options = [
+        (
+            _truncate(str(opt).strip(), TG_OPTION_MAX)
+            if str(opt).strip()
+            else "—"
+        )
+        for opt in options
+    ]
 
-    poll_question = _truncate(
-        poll_question,
-        TG_QUESTION_MAX
+    # BULB EXPLANATION:
+    # Explanation + examples/reference text.
+    bulb_parts: list[str] = []
+
+    if explanation and explanation.strip():
+        bulb_parts.append(explanation.strip())
+
+    if reply_text and reply_text.strip():
+        bulb_parts.append(
+            "उदाहरण / संदर्भ: " + reply_text.strip()
+        )
+
+    bulb_text = "\n\n".join(bulb_parts)
+
+    poll_explanation = (
+        _truncate(bulb_text, TG_EXPLANATION_MAX)
+        if bulb_text
+        else None
     )
 
-    # FIX:
-    # Keep the actual text of EVERY option.
-    # Never replace all options with Option A / Option B.
-    poll_options = []
-
-    for opt in options:
-        option_text = str(opt).strip()
-
-        if not option_text:
-            option_text = "—"
-
-        # Telegram allows maximum 100 characters per option.
-        option_text = _truncate(
-            option_text,
-            TG_OPTION_MAX
-        )
-
-        poll_options.append(option_text)
-
-    # Prepare explanation.
-    poll_explanation = None
-
-    if explanation:
-        poll_explanation = (
-            _truncate(explanation, EXPLANATION_TRIM)
-            if len(explanation) > TG_EXPLANATION_MAX
-            else explanation
-        )
-
-    # Prepare description.
+    # Full question and reference text.
     desc_parts: list[str] = []
 
     if needs_overflow:
@@ -287,20 +254,17 @@ def prepare_poll_data(
             f"Q{question_index + 1}/{total_questions}: {full_body}"
         )
 
-    if reply_text:
-        if desc_parts:
-            desc_parts.append(f"\n\n📝 {reply_text}")
-        else:
-            desc_parts.append(f"📝 {reply_text}")
+    if reply_text and reply_text.strip():
+        desc_parts.append(
+            f"\n\n📝 {reply_text.strip()}"
+        )
 
-    # Show complete original options in description
-    # whenever any option exceeds Telegram's limit.
     if any_option_long:
         desc_parts.append("\n\nOptions:")
 
         for i, opt in enumerate(options):
             desc_parts.append(
-                f"\n\n{chr(65 + i)}) {opt}"
+                f"\n  {chr(65 + i)}) {opt}"
             )
 
     if not desc_parts:
@@ -323,24 +287,25 @@ def prepare_poll_data(
             description_text
         )
 
-    # Description exceeded Telegram's limit.
-    # Send remaining full content separately.
+    # If description exceeds limit, send separate message.
     overflow_parts = [
         f"📋 <b>Q{question_index + 1}/{total_questions}</b>",
         f"\n\n{full_body}"
     ]
 
-    if reply_text:
+    if reply_text and reply_text.strip():
         overflow_parts.append(
-            f"\n\n📝 {reply_text}"
+            f"\n\n📝 {reply_text.strip()}"
         )
 
     if any_option_long:
-        overflow_parts.append("\n\n🔤 <b>Options:</b>")
+        overflow_parts.append(
+            "\n\n🔤 <b>Options:</b>"
+        )
 
         for i, opt in enumerate(options):
             overflow_parts.append(
-                f"\n\n<b>{chr(65 + i)})</b> {opt}"
+                f"\n  <b>{chr(65 + i)})</b> {opt}"
             )
 
     return (
