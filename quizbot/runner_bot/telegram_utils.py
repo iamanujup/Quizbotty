@@ -1,11 +1,4 @@
 
-"""
-Advance Quiz Bot — Open Source Project
-This project was originally developed by Gagan (github.com/devgaganin).
-Reference: https://t.me/advance_quiz_bot
-The codebase has been reviewed and verified with the assistance of Claude AI.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,14 +6,20 @@ import logging
 import random
 from typing import Any, Optional
 
-from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.error import (
+    BadRequest,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 from telegram.ext import ContextTypes
 
 from .state import pending_quiz_settings, session_mgr
 
 logger = logging.getLogger(__name__)
 
-TG_QUESTION_MAX = 295
+TG_QUESTION_MAX = 300
 TG_OPTION_MAX = 100
 TG_EXPLANATION_MAX = 200
 TG_DESCRIPTION_MAX = 1024
@@ -34,18 +33,24 @@ RETRY_BASE_DELAY = 1.5
 POLL_SEND_DELAY = 0.3
 
 
-async def send_raw_api(ctx: ContextTypes.DEFAULT_TYPE, method: str, params: dict[str, Any]) -> Any:
-    """Adapter used by quizbot.shared.rich_quiz."""
+async def send_raw_api(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    method: str,
+    params: dict[str, Any],
+) -> Any:
+    """Adapter used by rich_quiz."""
     return await ctx.bot.do_api_request(method, api_kwargs=params)
 
 
 def _get_topic_thread_id(chat_id: int) -> Optional[int]:
-    """Return message_thread_id for chat_id."""
+    """Return message_thread_id from active session or pending settings."""
     s = session_mgr.get(chat_id)
+
     if s and s.get("message_thread_id"):
         return s["message_thread_id"]
 
     ps = pending_quiz_settings.get(chat_id)
+
     if ps and ps.get("message_thread_id"):
         return ps["message_thread_id"]
 
@@ -53,7 +58,10 @@ def _get_topic_thread_id(chat_id: int) -> Optional[int]:
 
 
 async def safe_send_message(
-    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, **kwargs: Any
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    **kwargs: Any,
 ) -> Optional[Any]:
     """Send a message with retry on errors."""
 
@@ -65,11 +73,15 @@ async def safe_send_message(
     for attempt in range(MAX_RETRIES):
         try:
             return await ctx.bot.send_message(
-                chat_id=chat_id, text=text, **kwargs
+                chat_id=chat_id,
+                text=text,
+                **kwargs,
             )
 
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after + random.uniform(0.5, 2.0))
+            await asyncio.sleep(
+                e.retry_after + random.uniform(0.5, 2.0)
+            )
 
         except (TimedOut, NetworkError):
             await asyncio.sleep(
@@ -77,19 +89,33 @@ async def safe_send_message(
             )
 
         except BadRequest as e:
-            logger.error("BadRequest sending message to %s: %s", chat_id, e)
+            logger.error(
+                "BadRequest sending message to %s: %s",
+                chat_id,
+                e,
+            )
             return None
 
         except TelegramError as e:
-            if "chat not found" in str(e).lower() or "bot was blocked" in str(e).lower():
+            if (
+                "chat not found" in str(e).lower()
+                or "bot was blocked" in str(e).lower()
+            ):
                 return None
-            await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
+            await asyncio.sleep(
+                RETRY_BASE_DELAY * (2 ** attempt)
+            )
 
         except Exception as e:
             logger.error("Unexpected send error: %s", e)
             return None
 
-    logger.error("Failed to send message to %s after %d retries", chat_id, MAX_RETRIES)
+    logger.error(
+        "Failed to send message to %s after %d retries",
+        chat_id,
+        MAX_RETRIES,
+    )
     return None
 
 
@@ -98,7 +124,7 @@ async def safe_send_poll(
     chat_id: int,
     question: str,
     options: list[str],
-    **kwargs: Any
+    **kwargs: Any,
 ) -> Optional[Any]:
     """Send a poll with retry on errors."""
 
@@ -113,11 +139,13 @@ async def safe_send_poll(
                 chat_id=chat_id,
                 question=question,
                 options=options,
-                **kwargs
+                **kwargs,
             )
 
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after + random.uniform(1.0, 3.0))
+            await asyncio.sleep(
+                e.retry_after + random.uniform(1.0, 3.0)
+            )
 
         except (TimedOut, NetworkError):
             await asyncio.sleep(
@@ -126,7 +154,12 @@ async def safe_send_poll(
 
         except BadRequest as e:
             err_msg = str(e).lower()
-            logger.error("BadRequest sending poll to %s: %s", chat_id, e)
+
+            logger.error(
+                "BadRequest sending poll to %s: %s",
+                chat_id,
+                e,
+            )
 
             if (
                 "too long" in err_msg
@@ -135,23 +168,35 @@ async def safe_send_poll(
             ):
                 return None
 
-            await asyncio.sleep(RETRY_BASE_DELAY * (attempt + 1))
+            await asyncio.sleep(
+                RETRY_BASE_DELAY * (attempt + 1)
+            )
 
         except TelegramError as e:
             if (
                 "chat not found" in str(e).lower()
                 or "not enough rights" in str(e).lower()
             ):
-                logger.error("Cannot send poll to %s: %s", chat_id, e)
+                logger.error(
+                    "Cannot send poll to %s: %s",
+                    chat_id,
+                    e,
+                )
                 return None
 
-            await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+            await asyncio.sleep(
+                RETRY_BASE_DELAY * (2 ** attempt)
+            )
 
         except Exception as e:
             logger.error("Unexpected poll error: %s", e)
             return None
 
-    logger.error("Failed to send poll to %s after %d retries", chat_id, MAX_RETRIES)
+    logger.error(
+        "Failed to send poll to %s after %d retries",
+        chat_id,
+        MAX_RETRIES,
+    )
     return None
 
 
@@ -161,7 +206,7 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
 
-    return text[:limit - 3].rstrip() + "..."
+    return text[: limit - 3].rstrip() + "..."
 
 
 def prepare_poll_data(
@@ -174,144 +219,121 @@ def prepare_poll_data(
     total_questions: int,
 ) -> tuple[str, list[str], Optional[str], Optional[str], Optional[str]]:
     """
-    Prepare Telegram Quiz Poll.
+    Prepare Telegram quiz poll.
 
-    1. Actual question appears in poll title.
-    2. Original option text is retained.
-    3. Explanation and examples appear in bulb.
-    4. Full content is retained in description/overflow.
+    - Actual question appears in poll title.
+    - Original option text is retained.
+    - Explanation and examples appear in bulb.
+    - Long content is retained in description/overflow.
     """
 
     prefix = f"[{question_index + 1}/{total_questions}] "
 
-    is_multiline = "\n" in question_text.strip()
+    full_body = (question_text or "").strip()
+    full_question = f"{prefix}{full_body}"
 
-    if is_multiline:
-        lines = [
-            ln for ln in question_text.strip().split("\n")
-            if ln.strip()
-        ]
-
-        poll_stem = lines[-1].strip()
-        full_body = question_text.strip()
-
-    else:
-        poll_stem = question_text.strip()
-        full_body = question_text.strip()
-
-    # ACTUAL QUESTION instead of "Choose the correct option"
+    # IMPORTANT: Use the actual question, not generic placeholder.
     poll_question = _truncate(
-        f"{prefix}{poll_stem}",
-        TG_QUESTION_MAX
+        full_question,
+        TG_QUESTION_MAX,
     )
 
-    any_option_long = any(
-        len(str(opt)) > OPTION_SOFT_LIMIT
-        for opt in options
+    question_was_truncated = (
+        len(full_question) > TG_QUESTION_MAX
     )
 
-    needs_overflow = (
-        is_multiline
-        or any_option_long
-        or len(prefix + poll_stem) > QUESTION_SOFT_LIMIT
-    )
+    # Preserve original options individually.
+    poll_options: list[str] = []
+    long_options: list[tuple[int, str]] = []
 
-    # Preserve original option text.
-    poll_options = [
-        (
-            _truncate(str(opt).strip(), TG_OPTION_MAX)
-            if str(opt).strip()
-            else "—"
-        )
-        for opt in options
-    ]
+    for i, option in enumerate(options):
+        original = str(option or "").strip() or "—"
 
-    # BULB EXPLANATION:
-    # Explanation + examples/reference text.
-    bulb_parts: list[str] = []
+        if len(original) > TG_OPTION_MAX:
+            long_options.append((i, original))
 
-    if explanation and explanation.strip():
-        bulb_parts.append(explanation.strip())
-
-    if reply_text and reply_text.strip():
-        bulb_parts.append(
-            "उदाहरण / संदर्भ: " + reply_text.strip()
+        poll_options.append(
+            _truncate(original, TG_OPTION_MAX)
         )
 
-    bulb_text = "\n\n".join(bulb_parts)
-
-    poll_explanation = (
-        _truncate(bulb_text, TG_EXPLANATION_MAX)
-        if bulb_text
-        else None
-    )
-
-    # Full question and reference text.
+    # Prepare description.
     desc_parts: list[str] = []
 
-    if needs_overflow:
+    if question_was_truncated:
         desc_parts.append(
             f"Q{question_index + 1}/{total_questions}: {full_body}"
         )
 
     if reply_text and reply_text.strip():
         desc_parts.append(
-            f"\n\n📝 {reply_text.strip()}"
+            f"📝 {reply_text.strip()}"
         )
 
-    if any_option_long:
-        desc_parts.append("\n\nOptions:")
+    if long_options:
+        desc_parts.append("Options:")
 
-        for i, opt in enumerate(options):
+        for i, original in long_options:
             desc_parts.append(
-                f"\n  {chr(65 + i)}) {opt}"
+                f"{chr(65 + i)}) {original}"
             )
 
-    if not desc_parts:
-        return (
-            poll_question,
-            poll_options,
-            poll_explanation,
-            None,
-            None
+    description_text = (
+        "\n\n".join(desc_parts)
+        if desc_parts else None
+    )
+
+    overflow_text = None
+    poll_description = None
+
+    if description_text:
+        if len(description_text) <= TG_DESCRIPTION_MAX:
+            poll_description = description_text
+        else:
+            overflow_text = description_text
+
+    # Bulb explanation + example/reference.
+    explanation_text = (explanation or "").strip()
+    reference_text = (reply_text or "").strip()
+
+    if explanation_text and reference_text:
+        separator = " | उदाहरण: "
+
+        reference_text = _truncate(
+            reference_text,
+            80,
         )
 
-    description_text = "".join(desc_parts)
-
-    if len(description_text) <= TG_DESCRIPTION_MAX:
-        return (
-            poll_question,
-            poll_options,
-            poll_explanation,
-            None,
-            description_text
+        explanation_limit = max(
+            1,
+            TG_EXPLANATION_MAX
+            - len(separator)
+            - len(reference_text),
         )
 
-    # If description exceeds limit, send separate message.
-    overflow_parts = [
-        f"📋 <b>Q{question_index + 1}/{total_questions}</b>",
-        f"\n\n{full_body}"
-    ]
-
-    if reply_text and reply_text.strip():
-        overflow_parts.append(
-            f"\n\n📝 {reply_text.strip()}"
+        bulb_text = (
+            _truncate(explanation_text, explanation_limit)
+            + separator
+            + reference_text
         )
 
-    if any_option_long:
-        overflow_parts.append(
-            "\n\n🔤 <b>Options:</b>"
+    elif reference_text:
+        bulb_text = "उदाहरण: " + _truncate(
+            reference_text,
+            TG_EXPLANATION_MAX - len("उदाहरण: "),
         )
 
-        for i, opt in enumerate(options):
-            overflow_parts.append(
-                f"\n  <b>{chr(65 + i)})</b> {opt}"
-            )
+    else:
+        bulb_text = explanation_text
+
+    poll_explanation = (
+        _truncate(bulb_text, TG_EXPLANATION_MAX)
+        if bulb_text else None
+    )
 
     return (
         poll_question,
         poll_options,
         poll_explanation,
-        "".join(overflow_parts),
-        None
+        overflow_text,
+        poll_description,
     )
