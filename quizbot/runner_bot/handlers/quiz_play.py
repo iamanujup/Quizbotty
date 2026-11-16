@@ -78,7 +78,7 @@ async def _send_force_sub_prompt(
 ) -> None:
     """Show join + retry buttons; retry reopens the same /start payload."""
     channel = (config.REQUIRED_SUB_CHANNEL or "MOCKMARG").strip().lstrip("@")
-    retry_url = f"https://t.me/MOCKMARGBOT?start={payload or 'home'}"
+    retry_url = f"https://t.me/MOCKMARGJUBOT?start={payload or 'home'}"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 JOIN CHANNEL", url=f"https://t.me/{channel}")],
         [InlineKeyboardButton("🔄 RETRY / VERIFY", url=retry_url)],
