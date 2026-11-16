@@ -1,3 +1,4 @@
+
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -242,10 +243,7 @@ async def _finalize_quiz(
         [InlineKeyboardButton("👥 Add to Group", url=f"https://t.me/{me.username}?startgroup={qid}")],
         [InlineKeyboardButton("🔗 Share", switch_inline_query=qid)],
     ]
-    # "Play" opens the visual Mini App player right here in this private
-    # chat -- a native web_app button, which Telegram only allows on
-    # messages sent directly to the user (exactly this context). Skipped
-    # entirely when MINI_APP_DOMAIN isn't configured.
+
     play_practice = mini_app_web_app_button(me.username, qid, "practice", "Play (Practice)")
     play_exam = mini_app_web_app_button(me.username, qid, "exam", "Play (Exam)")
     if play_practice and play_exam:
@@ -313,41 +311,60 @@ async def quicksave_cb(c: Client, cb: CallbackQuery) -> None:
 
 
 async def handle_document(c: Client, m: Message) -> None:
-    """Handle a .txt/.json file sent while a quiz-creation session is
-    active -- imports questions in bulk (see handlers/file_import.py)."""
+    """Handle a .txt/.json/.html/.htm file sent while a quiz-creation session
+    is active -- imports questions in bulk."""
     uid = m.from_user.id
     if not await is_premium_user(uid):
         return
     if uid not in state.quiz_creation:
         return
+
     filename = (m.document.file_name or "").lower()
-    allowed_types = ("text/plain", "application/json", "text/html", "application/xhtml+xml")
-    is_supported_extension = filename.endswith((".txt", ".json", ".html", ".htm"))
-    if not is_supported_extension and m.document.mime_type not in allowed_types:
-        await m.reply("⚠️ Send a .txt, .json or supported .html quiz file.")
+
+    allowed_types = (
+        "text/plain",
+        "application/json",
+        "text/html",
+        "application/xhtml+xml",
+    )
+    allowed_extensions = (".txt", ".json", ".html", ".htm")
+
+    if (
+        m.document.mime_type not in allowed_types
+        and not filename.endswith(allowed_extensions)
+    ):
+        await m.reply(
+            "⚠️ Only .txt, .json, .html or .htm files are supported for quiz questions."
+        )
         return
 
     status = await m.reply("⏳ Processing...")
-    file_bytes = await c.download_media(m.document.file_id, in_memory=True)
+
+    file_bytes = await c.download_media(
+        m.document.file_id,
+        in_memory=True
+    )
     file_bytes.seek(0)
     content = file_bytes.read()
 
     user = await UserRepository(get_db()).get_or_create(uid)
     remove_words = user.get("remove_words", [])
 
-    upload_name = m.document.file_name or (
-        "upload.html" if m.document.mime_type in ("text/html", "application/xhtml+xml")
-        else "upload.json" if m.document.mime_type == "application/json"
-        else "upload.txt"
-    )
     count, error = process_uploaded_file(
-        content, upload_name, state.quiz_creation[uid]["questions"], remove_words
+        content,
+        m.document.file_name or "upload.txt",
+        state.quiz_creation[uid]["questions"],
+        remove_words,
     )
+
     if error:
         await status.edit_text(f"❌ Error: {error}")
     else:
         total = len(state.quiz_creation[uid]["questions"])
-        await status.edit_text(f"✅ {count} questions processed! Total: {total}\nSend more or /done")
+        await status.edit_text(
+            f"✅ {count} questions processed! Total: {total}\n"
+            "Send more or /done"
+        )
 
 
 async def handle_creation_message(c: Client, m: Message) -> None:
@@ -368,37 +385,35 @@ async def handle_creation_message(c: Client, m: Message) -> None:
         remove_words = user.get("remove_words", [])
         question = strip_source_noise(filter_words(_poll_text(poll.question), remove_words))
         options = [filter_words(_poll_text(o.text), remove_words) for o in poll.options]
-        # Confirmed via live log against this Kurigram build: a closed quiz
-        # poll (the normal state of a poll someone forwards to the bot)
-        # exposes the correct answer as `correct_option_id` -- SINGULAR,
-        # a plain int -- not `correct_option_ids` (plural/list). The plural
-        # attribute simply doesn't exist on this object at all, so the
-        # previous getattr(poll, "correct_option_ids", ...) silently and
-        # always fell through to 0, which is why every imported poll ended
-        # up marking option 1 (index 0) as correct regardless of the
-        # poll's real checkmark.
+
         correct_id = getattr(poll, "correct_option_id", None)
         if correct_id is None:
-            # Defensive fallback for any future/older Kurigram build that
-            # instead reports the plural, list-shaped attribute.
             correct_ids = getattr(poll, "correct_option_ids", None) or []
             correct_id = correct_ids[0] if correct_ids else 0
+
         explanation = None
         if getattr(poll, "explanation", None):
             explanation = strip_source_noise(filter_words(_poll_text(poll.explanation), remove_words))
+
         reply_msg = m.reply_to_message
         reply_text = reply_msg.text if reply_msg and reply_msg.text else None
         file_id = None
+
         if reply_msg and reply_msg.photo and config.BOT_GROUP:
             try:
                 copied = await c.copy_message(config.BOT_GROUP, reply_msg.chat.id, reply_msg.id)
                 file_id = copied.photo.file_id
             except Exception:
                 logger.debug("Failed to copy poll's reply photo", exc_info=True)
+
         ud["questions"].append(
             {
-                "question": question, "options": options, "correct_option_id": correct_id,
-                "explanation": explanation, "file_id": file_id, "reply_text": reply_text,
+                "question": question,
+                "options": options,
+                "correct_option_id": correct_id,
+                "explanation": explanation,
+                "file_id": file_id,
+                "reply_text": reply_text,
             }
         )
         await m.reply(f"✅ {len(ud['questions'])} saved! Send more or /done")
@@ -414,7 +429,11 @@ async def handle_creation_message(c: Client, m: Message) -> None:
             return
         ud["quiz_name"] = name
         ud["awaiting_name"] = False
-        await m.reply(f"📝 Name: **{name}**\nSend questions, forward quiz polls, or a .txt file. /cancel to abort.")
+        await m.reply(
+            f"📝 Name: **{name}**\n"
+            "Send questions, forward quiz polls, or a .txt/.json/.html file. "
+            "/cancel to abort."
+        )
         return
 
     if ud.get("awaiting_section_choice"):
@@ -424,6 +443,7 @@ async def handle_creation_message(c: Client, m: Message) -> None:
             return
         ud["section_wise"] = choice == "yes"
         del ud["awaiting_section_choice"]
+
         if ud["section_wise"]:
             ud["awaiting_section_count"] = True
             await m.reply("📚 How many sections? (>1)")
@@ -489,6 +509,7 @@ async def handle_creation_message(c: Client, m: Message) -> None:
             return
         ud["sections"][-1]["timer"] = timer
         del ud["awaiting_section_timer"]
+
         if len(ud["sections"]) < ud["section_count"]:
             ud["current_section"] += 1
             ud["awaiting_section_name"] = True
@@ -507,8 +528,13 @@ async def handle_creation_message(c: Client, m: Message) -> None:
         settings = await settings_repo.get(uid)
         default_text = settings.get("default_text")
         default_text_field = settings.get("default_text_field", "both")
+
         if default_text:
-            field_labels = {"question": "questions", "explanation": "explanations", "both": "questions & explanations"}
+            field_labels = {
+                "question": "questions",
+                "explanation": "explanations",
+                "both": "questions & explanations",
+            }
             ud["awaiting_default_text_confirm"] = True
             ud["_dt"] = default_text
             ud["_dtf"] = default_text_field
@@ -521,16 +547,18 @@ async def handle_creation_message(c: Client, m: Message) -> None:
                 ]
             )
             await m.reply(
-                f"💡 **Add default text to {field_labels.get(default_text_field, 'fields')}?**\n\n`{default_text[:100]}`",
+                f"💡 **Add default text to {field_labels.get(default_text_field, 'fields')}?**\n\n"
+                f"`{default_text[:100]}`",
                 reply_markup=kb,
             )
             return
+
         ud["awaiting_type"] = True
         await m.reply("📊 Type (free/paid)")
         return
 
     if ud.get("awaiting_default_text_confirm"):
-        return  # handled via the dtc_yes/dtc_no callback
+        return
 
     if ud.get("awaiting_type"):
         quiz_type = m.text.strip().lower()
@@ -549,6 +577,7 @@ async def handle_creation_message(c: Client, m: Message) -> None:
     reply_msg = m.reply_to_message
     reply_text = reply_msg.text if reply_msg and reply_msg.text else None
     file_id = None
+
     if reply_msg and reply_msg.photo and config.BOT_GROUP:
         try:
             copied = await c.copy_message(config.BOT_GROUP, reply_msg.chat.id, reply_msg.id)
@@ -557,10 +586,13 @@ async def handle_creation_message(c: Client, m: Message) -> None:
             logger.debug("Failed to copy pasted question's reply photo", exc_info=True)
 
     parsed_any = False
+
     for block in blocks:
         if not block.strip():
             continue
+
         parsed = parse_question_block(block)
+
         if not parsed:
             await m.reply(
                 "⚠️ Invalid format.\n\nMark the correct option with a check-mark emoji. "
@@ -568,6 +600,7 @@ async def handle_creation_message(c: Client, m: Message) -> None:
                 "or start each option with A) B) C) D)."
             )
             return
+
         parsed["file_id"] = file_id
         parsed["reply_text"] = reply_text
         ud["questions"].append(parsed)
@@ -576,6 +609,7 @@ async def handle_creation_message(c: Client, m: Message) -> None:
     if not parsed_any:
         await m.reply("⚠️ No valid question found.")
         return
+
     total = len(ud["questions"])
     suffix = " Consider stopping soon." if total > 200 else " Send more or /done"
     await m.reply(f"✅ {total} saved!{suffix}")
@@ -586,14 +620,18 @@ async def default_text_confirm_cb(c: Client, cb: CallbackQuery) -> None:
     creator's saved default text before proceeding to type selection."""
     uid = cb.from_user.id
     action = cb.data.split("_")[1]
+
     if uid not in state.quiz_creation:
         await cb.answer("⚠️ Session expired", show_alert=True)
         return
+
     ud = state.quiz_creation[uid]
     ud.pop("awaiting_default_text_confirm", None)
+
     if action == "no":
         ud.pop("_dt", None)
         ud.pop("_dtf", None)
+
     ud["awaiting_type"] = True
     await cb.message.reply("📊 Type (free/paid)")
     await cb.answer()
