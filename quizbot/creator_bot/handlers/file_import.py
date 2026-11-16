@@ -1,11 +1,4 @@
-
-"""
-Advance Quiz Bot — Open Source Project
-HTML, JSON and TXT Quiz Import Support
-"""
-
-from __future__ import annotations
-
+import html as html_lib
 import json
 import logging
 import re
@@ -218,20 +211,7 @@ def _process_json(
 
 
 def _extract_html_questions(content: str) -> list:
-    """
-    Extract the Qs array from HTML files.
-
-    Supported format:
-        const Qs = [
-            {
-                question: "...",
-                options: ["...", "..."],
-                correct: 1,
-                solution: "..."
-            }
-        ];
-    """
-
+    """Extract the Qs array from HTML files."""
     patterns = [
         r"\b(?:const|let|var)\s+Qs\s*=\s*",
         r"\b(?:const|let|var)\s+questions\s*=\s*",
@@ -265,6 +245,47 @@ def _extract_html_questions(content: str) -> list:
         raise ValueError("HTML quiz data must be an array.")
 
     return data
+
+
+def _clean_html_poll_value(value, remove_words: list[str] | None = None):
+    """Convert HTML question content to plain poll text."""
+    if value is None:
+        return None
+
+    text = str(value)
+
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"</\s*(?:p|div|li|tr|h[1-6])\s*>",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"<\s*(script|style)\b[^>]*>[\s\S]*?</\s*\1\s*>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<\s*/?\s*(?:a|abbr|b|blockquote|br|caption|code|del|div|em|"
+        r"font|h[1-6]|hr|i|img|li|ol|p|pre|s|small|span|strong|sub|sup|"
+        r"table|tbody|td|th|thead|tr|u|ul)\b[^>]*>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    if remove_words:
+        text = filter_words(text, remove_words)
+
+    return strip_source_noise(text)
 
 
 def _process_html(
@@ -301,7 +322,7 @@ def _process_html(
                 if option is None:
                     option = ""
 
-                option = _clean_value(option, remove_words)
+                option = _clean_html_poll_value(option, remove_words)
 
                 if not option:
                     continue
@@ -316,22 +337,19 @@ def _process_html(
             except (TypeError, ValueError):
                 continue
 
-            # HTML quiz format uses 1-based correct answers.
-            # Convert them to the bot's 0-based option index.
             if 1 <= correct_index <= len(options):
                 correct_index -= 1
             elif 0 <= correct_index < len(options):
-                # Also accept an already zero-based index.
                 pass
             else:
                 continue
 
-            question = _clean_value(question, remove_words)
+            question = _clean_html_poll_value(question, remove_words)
 
             if not question:
                 continue
 
-            explanation = _clean_value(
+            explanation = _clean_html_poll_value(
                 q.get("solution") or q.get("explanation"),
                 remove_words,
             )
@@ -363,12 +381,7 @@ def process_uploaded_file(
     out_questions: list[dict],
     remove_words: list[str],
 ) -> tuple[Optional[int], Optional[str]]:
-    """
-    Process TXT, JSON and HTML quiz files.
-
-    Returns:
-        (count_processed, error_message)
-    """
+    """Process TXT, JSON and HTML quiz files."""
 
     lower = filename.lower()
 
