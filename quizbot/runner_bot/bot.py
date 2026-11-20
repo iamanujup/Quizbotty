@@ -1,3 +1,4 @@
+
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -13,6 +14,7 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application
+from telegram.request import HTTPXRequest
 
 from quizbot.shared import config
 
@@ -27,62 +29,120 @@ scheduler = AsyncIOScheduler()
 
 
 async def post_init(application: Application) -> None:
-    """Runs once after Application.initialize() -- starts the scheduler and
-    the background watchdog task."""
+    """Start scheduler and watchdog."""
+
     init_schedule_manager(scheduler)
     scheduler.start()
-    tasks.spawn(watchdog_loop(), name="watchdog")
-    logger.info("Runner Bot post_init complete (scheduler + watchdog started).")
+
+    tasks.spawn(
+        watchdog_loop(),
+        name="watchdog",
+    )
+
+    logger.info(
+        "Runner Bot post_init complete (scheduler + watchdog started)."
+    )
 
 
 async def post_shutdown(application: Application) -> None:
-    """Runs once during Application.shutdown() -- tears down the scheduler."""
+    """Stop scheduler."""
+
     scheduler.shutdown(wait=False)
-    logger.info("Runner Bot post_shutdown complete.")
+
+    logger.info(
+        "Runner Bot post_shutdown complete."
+    )
 
 
 def build_application() -> Application:
-    """Construct the PTB Application with every handler registered."""
+    """Construct PTB Application with timeout configuration."""
+
+    api_request = HTTPXRequest(
+        connection_pool_size=32,
+        connect_timeout=30,
+        read_timeout=60,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+
+    polling_request = HTTPXRequest(
+        connection_pool_size=4,
+        connect_timeout=30,
+        read_timeout=60,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+
     application = (
         Application.builder()
         .token(config.RUNNER_BOT_TOKEN)
+        .request(api_request)
+        .get_updates_request(polling_request)
+        .get_updates_read_timeout(60)
         .concurrent_updates(True)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .pool_timeout(30)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
+
     handlers.register(application)
+
     return application
 
 
 async def run_runner_bot() -> None:
-    """Run the Runner Bot non-blocking, as one of two concurrent asyncio
-    tasks sharing a single event loop with the Creator Bot.
+    """Run Runner Bot with manual PTB lifecycle."""
 
-    Uses the manual PTB lifecycle (initialize/start/start_polling) instead
-    of `run_polling()`, which owns its own event loop and would block the
-    other bot from running alongside it in the same process.
-    """
     application = build_application()
 
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
-    logger.info("Runner Bot polling started.")
+    initialized = False
+    started = False
+    polling_started = False
 
     try:
-        # Block here until this task is cancelled by the launcher (run.py),
-        # which happens on SIGINT/SIGTERM or if the sibling bot task dies.
+        await application.initialize()
+        initialized = True
+
+        await application.start()
+        started = True
+
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            timeout=20,
+            read_timeout=60,
+        )
+
+        polling_started = True
+
+        logger.info("Runner Bot polling started.")
+
+        # Wait until launcher requests shutdown.
         await asyncio.Future()
+
     finally:
         logger.info("Runner Bot shutting down...")
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+
+        if polling_started:
+            try:
+                await application.updater.stop()
+            except Exception:
+                logger.exception(
+                    "Error while stopping Runner Bot polling"
+                )
+
+        if started:
+            try:
+                await application.stop()
+            except Exception:
+                logger.exception(
+                    "Error while stopping Runner Bot application"
+                )
+
+        if initialized:
+            try:
+                await application.shutdown()
+            except Exception:
+                logger.exception(
+                    "Error while shutting down Runner Bot application"
+                )
