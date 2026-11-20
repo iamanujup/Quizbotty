@@ -1,9 +1,7 @@
 
 """
-Advance Quiz Bot — Open Source Project
-This project was originally developed by Gagan (github.com/devgaganin).
-Reference: https://t.me/advance_quiz_bot
-The codebase has been reviewed and verified with the assistance of Claude AI.
+Advance Quiz Bot — Creator Bot
+FloodWait protection and safe startup retry.
 """
 
 from __future__ import annotations
@@ -11,137 +9,113 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update
-from telegram.ext import Application
-from telegram.request import HTTPXRequest
+from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 from quizbot.shared import config
 
-from . import handlers
-from .handlers.admin import watchdog_loop
-from .handlers.scheduling import init_schedule_manager
-from .state import tasks
-
 logger = logging.getLogger(__name__)
 
-scheduler = AsyncIOScheduler()
 
+def build_client() -> Client:
+    """Build Creator Bot client with persistent session."""
 
-async def post_init(application: Application) -> None:
-    """Start scheduler and watchdog."""
-
-    init_schedule_manager(scheduler)
-    scheduler.start()
-
-    tasks.spawn(
-        watchdog_loop(),
-        name="watchdog",
-    )
-
-    logger.info(
-        "Runner Bot post_init complete (scheduler + watchdog started)."
+    return Client(
+        "creator_bot",
+        api_id=config.API_ID,
+        api_hash=config.API_HASH,
+        bot_token=config.CREATOR_BOT_TOKEN,
+        workers=50,
     )
 
 
-async def post_shutdown(application: Application) -> None:
-    """Stop scheduler."""
+async def wait_for_retry(
+    stop_event: asyncio.Event,
+    seconds: int,
+) -> None:
+    """Wait without blocking other bot tasks."""
 
-    scheduler.shutdown(wait=False)
-
-    logger.info(
-        "Runner Bot post_shutdown complete."
+    logger.warning(
+        "Creator Bot waiting %s seconds before retry.",
+        seconds,
     )
-
-
-def build_application() -> Application:
-    """Construct PTB Application with timeout configuration."""
-
-    api_request = HTTPXRequest(
-        connection_pool_size=32,
-        connect_timeout=30,
-        read_timeout=60,
-        write_timeout=30,
-        pool_timeout=30,
-    )
-
-    polling_request = HTTPXRequest(
-        connection_pool_size=4,
-        connect_timeout=30,
-        read_timeout=60,
-        write_timeout=30,
-        pool_timeout=30,
-    )
-
-    application = (
-        Application.builder()
-        .token(config.RUNNER_BOT_TOKEN)
-        .request(api_request)
-        .get_updates_request(polling_request)
-        .concurrent_updates(True)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    handlers.register(application)
-
-    return application
-
-
-async def run_runner_bot() -> None:
-    """Run Runner Bot with manual PTB lifecycle."""
-
-    application = build_application()
-
-    initialized = False
-    started = False
-    polling_started = False
 
     try:
-        await application.initialize()
-        initialized = True
-
-        await application.start()
-        started = True
-
-        await application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            timeout=20,
-            read_timeout=60,
+        await asyncio.wait_for(
+            stop_event.wait(),
+            timeout=seconds,
         )
+    except asyncio.TimeoutError:
+        pass
 
-        polling_started = True
 
-        logger.info("Runner Bot polling started.")
+async def run_creator_bot(
+    stop_event: asyncio.Event | None = None,
+) -> None:
+    """Start Creator Bot with FloodWait protection."""
 
-        # Wait until launcher requests shutdown.
-        await asyncio.Future()
+    own_event = stop_event or asyncio.Event()
 
-    finally:
-        logger.info("Runner Bot shutting down...")
+    while not own_event.is_set():
 
-        if polling_started:
-            try:
-                await application.updater.stop()
-            except Exception:
-                logger.exception(
-                    "Error while stopping Runner Bot polling"
-                )
+        app = build_client()
 
-        if started:
-            try:
-                await application.stop()
-            except Exception:
-                logger.exception(
-                    "Error while stopping Runner Bot application"
-                )
+        from .handlers import register
 
-        if initialized:
-            try:
-                await application.shutdown()
-            except Exception:
-                logger.exception(
-                    "Error while shutting down Runner Bot application"
-                )
+        try:
+            register(app)
+
+            await app.start()
+
+            me = await app.get_me()
+
+            logger.info(
+                "Creator Bot started as @%s",
+                me.username,
+            )
+
+            await own_event.wait()
+            return
+
+        except asyncio.CancelledError:
+            raise
+
+        except FloodWait as error:
+
+            delay = max(int(error.value), 1) + 5
+
+            logger.warning(
+                "Telegram FloodWait: waiting %s seconds.",
+                delay,
+            )
+
+            await wait_for_retry(
+                own_event,
+                delay,
+            )
+
+        finally:
+
+            if app.is_connected:
+                try:
+                    await app.stop()
+
+                    logger.info(
+                        "Creator Bot stopped."
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Creator Bot shutdown error."
+                    )
+
+
+if __name__ == "__main__":
+
+    logging.basicConfig(
+        level=logging.INFO,
+    )
+
+    asyncio.run(
+        run_creator_bot()
+    )
