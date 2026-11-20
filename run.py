@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Advance Quiz Bot — Open Source Project
@@ -24,7 +25,6 @@ logging.basicConfig(
 
 logger = logging.getLogger("launcher")
 
-# Silence noisy third-party debug logs.
 for noisy in ("httpx", "httpcore", "apscheduler", "pymongo"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -50,18 +50,50 @@ async def _run_mini_app() -> None:
     await run_mini_app_server()
 
 
+async def _run_resilient(name: str, runner, stop_event: asyncio.Event) -> None:
+    """Restart a component after transient failures."""
+    delay = 5
+
+    while not stop_event.is_set():
+        try:
+            await runner()
+
+            if stop_event.is_set():
+                return
+
+            logger.warning(
+                "%s exited unexpectedly; restarting in %s seconds",
+                name,
+                delay,
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+            logger.exception(
+                "%s failed; restarting in %s seconds",
+                name,
+                delay,
+            )
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=delay,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+        delay = min(delay * 2, 60)
+
+
 async def _run_render_health_server() -> None:
-    """
-    Small HTTP server for Render Web Service.
-    Keeps the Render service alive and provides a health endpoint.
-    """
+    """Render health server."""
 
     port = int(os.environ.get("PORT", "10000"))
 
-    async def handle_client(
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> None:
+    async def handle_client(reader, writer):
         try:
             await reader.read(4096)
 
@@ -83,8 +115,10 @@ async def _run_render_health_server() -> None:
 
         except Exception:
             pass
+
         finally:
             writer.close()
+
             try:
                 await writer.wait_closed()
             except Exception:
@@ -96,7 +130,10 @@ async def _run_render_health_server() -> None:
         port=port,
     )
 
-    addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
+    addresses = ", ".join(
+        str(sock.getsockname())
+        for sock in server.sockets or []
+    )
 
     logger.info("Render health server listening on %s", addresses)
 
@@ -105,6 +142,7 @@ async def _run_render_health_server() -> None:
 
 
 async def main(only: str | None) -> None:
+
     problems = config.validate(bot=only or "both")
 
     if problems:
@@ -114,6 +152,7 @@ async def main(only: str | None) -> None:
         logger.error(
             "Fix the above in your .env file (see .env.example) before starting."
         )
+
         sys.exit(1)
 
     logger.info(
@@ -129,12 +168,17 @@ async def main(only: str | None) -> None:
     logger.info("Database ready.")
 
     tasks: list[asyncio.Task] = []
+    stop_event = asyncio.Event()
 
     # Creator Bot
     if only in (None, "creator"):
         tasks.append(
             asyncio.create_task(
-                _run_creator_bot(),
+                _run_resilient(
+                    "Creator Bot",
+                    _run_creator_bot,
+                    stop_event,
+                ),
                 name="creator_bot",
             )
         )
@@ -143,7 +187,11 @@ async def main(only: str | None) -> None:
     if only in (None, "runner"):
         tasks.append(
             asyncio.create_task(
-                _run_runner_bot(),
+                _run_resilient(
+                    "Runner Bot",
+                    _run_runner_bot,
+                    stop_event,
+                ),
                 name="runner_bot",
             )
         )
@@ -153,38 +201,44 @@ async def main(only: str | None) -> None:
 
     if only == "miniapp":
         mini_app_enabled = True
+
         tasks.append(
             asyncio.create_task(
-                _run_mini_app(),
+                _run_resilient(
+                    "Mini App",
+                    _run_mini_app,
+                    stop_event,
+                ),
                 name="mini_app",
             )
         )
 
     elif only is None and config.MINI_APP_DOMAIN:
         mini_app_enabled = True
+
         tasks.append(
             asyncio.create_task(
-                _run_mini_app(),
+                _run_resilient(
+                    "Mini App",
+                    _run_mini_app,
+                    stop_event,
+                ),
                 name="mini_app",
             )
         )
 
-    # ---------------------------------------------------------
-    # Render Web Service PORT
-    # ---------------------------------------------------------
-    #
-    # If Mini App is not running, start a tiny HTTP server
-    # so Render detects an open port.
-    #
+    # Render Health Server
     if not mini_app_enabled:
         tasks.append(
             asyncio.create_task(
-                _run_render_health_server(),
+                _run_resilient(
+                    "Render health server",
+                    _run_render_health_server,
+                    stop_event,
+                ),
                 name="render_health_server",
             )
         )
-
-    stop_event = asyncio.Event()
 
     def _handle_signal(*_args):
         logger.info("Shutdown signal received, stopping bots...")
@@ -231,7 +285,6 @@ async def main(only: str | None) -> None:
                     exc_info=exception,
                 )
 
-        # Cancel remaining tasks if one of the main tasks exits.
         for task in pending:
             task.cancel()
 
@@ -242,6 +295,8 @@ async def main(only: str | None) -> None:
 
     finally:
         logger.info("Shutting down...")
+
+        stop_event.set()
 
         for task in tasks:
             if not task.done():
@@ -259,6 +314,7 @@ async def main(only: str | None) -> None:
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(
         description="Run the Advance Quiz Bot platform."
     )
