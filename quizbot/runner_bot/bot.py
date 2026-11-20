@@ -78,7 +78,6 @@ def build_application() -> Application:
         .token(config.RUNNER_BOT_TOKEN)
         .request(api_request)
         .get_updates_request(polling_request)
-        .get_updates_read_timeout(60)
         .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
