@@ -17,6 +17,9 @@ from .routes import create_app
 
 logger = logging.getLogger(__name__)
 
+# 🟢 यहाँ global 'app' बना दिया गया है ताकि launcher इसे import कर सके
+app = create_app()
+
 
 async def run_mini_app_server() -> None:
     """Start the Mini App HTTP server and run until cancelled."""
@@ -28,9 +31,9 @@ async def run_mini_app_server() -> None:
             "in .env to enable them."
         )
 
-    app = create_app()
+    # 🔴 यहाँ से 'app = create_app()' हटा दिया गया है क्योंकि अब यह ऊपर global है
     uv_config = uvicorn.Config(
-        app,
+        app,  # अब यह ऊपर वाले global app को इस्तेमाल करेगा
         host=config.MINI_APP_HOST,
         port=config.MINI_APP_PORT,
         log_level="info",
