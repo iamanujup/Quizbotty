@@ -12,7 +12,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("launcher")
 
-# --- 1. Dummy Web Server for Render (तााकि Render इसे Web Service समझे) ---
+# --- 1. Dummy Web Server for Render ---
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -26,7 +26,7 @@ def run_dummy_web_server():
     logger.info(f"Dummy web server running on port {port}")
     server.serve_forever()
 
-# --- 2. Mini App Server (अगर आप बाद में इस्तेमाल करना चाहें) ---
+# --- 2. Mini App Server ---
 def run_mini_app():
     try:
         from quizbot.mini_app.server import app
@@ -37,15 +37,25 @@ def run_mini_app():
     except Exception as e:
         logger.error(f"Mini App failed: {e}")
 
-# --- 3. Database Initialization ---
+# --- 3. Database Initialization (यहाँ सुधार किया गया है) ---
 async def init_database():
     logger.info("Initializing Database...")
     try:
         from quizbot.database.db import init_db
-        await init_db()
+        from quizbot.shared import config
+        
+        # config से MONGODB_URI और MONGODB_DB_NAME लें
+        mongo_uri = config.MONGODB_URI
+        db_name = getattr(config, "MONGODB_DB_NAME", "quizbot")
+        
+        if not mongo_uri:
+            logger.error("MONGODB_URI is not set in .env!")
+            return
+
+        await init_db(uri=mongo_uri, db_name=db_name)
         logger.info("Database initialized successfully.")
-    except ImportError:
-        logger.error("Could not find init_db in quizbot.database.db.")
+    except ImportError as e:
+        logger.error(f"Import Error in Database: {e}")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
 
@@ -57,7 +67,7 @@ async def _run_creator_bot():
 
 # --- 5. Runner Bot ---
 async def _run_runner_bot():
-    # आपकी bot.py में run_creator_bot फंक्शन है
+    # आपकी runner_bot/bot.py में run_creator_bot फंक्शन है
     from quizbot.runner_bot.bot import run_creator_bot as run_runner_bot
     logger.info("Starting Runner Bot...")
     await run_runner_bot()
@@ -72,15 +82,15 @@ async def _run_resilient(name, runner_func, delay=10):
             await asyncio.sleep(delay)
 
 async def main():
-    # सबसे पहले Render के लिए डमी वेब सर्वर शुरू करें
+    # पहले Render के लिए डमी वेब सर्वर शुरू करें
     threading.Thread(target=run_dummy_web_server, daemon=True).start()
-
-    # अगर Mini App डोमेन सेट है, तो उसे भी शुरू करें
-    if os.environ.get("MINI_APP_DOMAIN"):
-        threading.Thread(target=run_mini_app, daemon=True).start()
 
     # डेटाबेस इनिशियलाइज़ करें
     await init_database()
+
+    # अगर Mini App डोमेन सेट है
+    if os.environ.get("MINI_APP_DOMAIN"):
+        threading.Thread(target=run_mini_app, daemon=True).start()
 
     only = None
     if len(sys.argv) > 2 and sys.argv[1] == "--only":
