@@ -23,15 +23,26 @@ def run_mini_app():
     except Exception as e:
         logger.error(f"Mini App failed: {e}")
 
+# Database Initialization (यह नया जोड़ा गया है)
+async def init_database():
+    logger.info("Initializing Database...")
+    try:
+        from quizbot.database.db import init_db
+        await init_db()
+        logger.info("Database initialized successfully.")
+    except ImportError:
+        logger.error("Could not find init_db in quizbot.database.db. Check your database/db.py file.")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+
 # Creator Bot
 async def _run_creator_bot():
     from quizbot.creator_bot.bot import run_creator_bot
     logger.info("Starting Creator Bot...")
     await run_creator_bot()
 
-# Runner Bot (यहाँ फिक्स किया गया है)
+# Runner Bot 
 async def _run_runner_bot():
-    # आपकी bot.py में 'run_creator_bot' फंक्शन है, इसलिए हम उसे इसी नाम से इम्पोर्ट कर रहे हैं
     from quizbot.runner_bot.bot import run_creator_bot as run_runner_bot
     logger.info("Starting Runner Bot...")
     await run_runner_bot()
@@ -46,6 +57,10 @@ async def _run_resilient(name, runner_func, delay=10):
             await asyncio.sleep(delay)
 
 async def main():
+    # 1. सबसे पहले डेटाबेस शुरू करें
+    await init_database()
+
+    # 2. फिर बॉट्स शुरू करें
     only = None
     if len(sys.argv) > 2 and sys.argv[1] == "--only":
         only = sys.argv[2]
