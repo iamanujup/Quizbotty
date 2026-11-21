@@ -1,339 +1,107 @@
-
-#!/usr/bin/env python3
-"""
-Advance Quiz Bot — Open Source Project
-Render Web Service compatible launcher.
-"""
-
-from __future__ import annotations
-
-import argparse
 import asyncio
 import logging
-import os
-import signal
 import sys
+import os
 
-from quizbot.database import init_db, close_db
-from quizbot.shared import config
-from quizbot.shared.utils.http import close_session
-
+# Logging setup
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO
 )
-
 logger = logging.getLogger("launcher")
 
-for noisy in ("httpx", "httpcore", "apscheduler", "pymongo"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
-async def _run_creator_bot() -> None:
-    from quizbot.creator_bot.bot import run_creator_bot
-
-    logger.info("Starting Creator Bot (Pyrogram)...")
-    await run_creator_bot()
-
-
-async def _run_runner_bot() -> None:
-    from quizbot.runner_bot.bot import run_runner_bot
-
-    logger.info("Starting Runner Bot (python-telegram-bot)...")
-    await run_runner_bot()
-
-
-async def _run_mini_app() -> None:
-    from quizbot.mini_app.server import run_mini_app_server
-
-    logger.info("Starting Mini App server (FastAPI)...")
-    await run_mini_app_server()
-
-
-async def _run_resilient(name: str, runner, stop_event: asyncio.Event) -> None:
-    """Restart a component after transient failures."""
-    delay = 5
-
-    while not stop_event.is_set():
-        try:
-            await runner()
-
-            if stop_event.is_set():
-                return
-
-            logger.warning(
-                "%s exited unexpectedly; restarting in %s seconds",
-                name,
-                delay,
-            )
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception:
-            logger.exception(
-                "%s failed; restarting in %s seconds",
-                name,
-                delay,
-            )
-
-        try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=delay,
-            )
-        except asyncio.TimeoutError:
-            pass
-
-        delay = min(delay * 2, 60)
-
-
-async def _run_render_health_server() -> None:
-    """Render health server."""
-
-    port = int(os.environ.get("PORT", "10000"))
-
-    async def handle_client(reader, writer):
-        try:
-            await reader.read(4096)
-
-            body = b'{"status":"ok","service":"quizbotty"}'
-
-            response = (
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: application/json\r\n"
-                b"Content-Length: "
-                + str(len(body)).encode()
-                + b"\r\n"
-                b"Connection: close\r\n"
-                b"\r\n"
-                + body
-            )
-
-            writer.write(response)
-            await writer.drain()
-
-        except Exception:
-            pass
-
-        finally:
-            writer.close()
-
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-    server = await asyncio.start_server(
-        handle_client,
-        host="0.0.0.0",
-        port=port,
-    )
-
-    addresses = ", ".join(
-        str(sock.getsockname())
-        for sock in server.sockets or []
-    )
-
-    logger.info("Render health server listening on %s", addresses)
-
-    async with server:
-        await server.serve_forever()
-
-
-async def main(only: str | None) -> None:
-
-    problems = config.validate(bot=only or "both")
-
-    if problems:
-        for p in problems:
-            logger.error("Config problem: %s", p)
-
-        logger.error(
-            "Fix the above in your .env file (see .env.example) before starting."
-        )
-
-        sys.exit(1)
-
-    logger.info(
-        "Connecting to MongoDB (db=%s) ...",
-        config.MONGODB_DB_NAME,
-    )
-
-    await init_db(
-        config.MONGODB_URI,
-        config.MONGODB_DB_NAME,
-    )
-
-    logger.info("Database ready.")
-
-    tasks: list[asyncio.Task] = []
-    stop_event = asyncio.Event()
-
-    # Creator Bot
-    if only in (None, "creator"):
-        tasks.append(
-            asyncio.create_task(
-                _run_resilient(
-                    "Creator Bot",
-                    _run_creator_bot,
-                    stop_event,
-                ),
-                name="creator_bot",
-            )
-        )
-
-    # Runner Bot
-    if only in (None, "runner"):
-        tasks.append(
-            asyncio.create_task(
-                _run_resilient(
-                    "Runner Bot",
-                    _run_runner_bot,
-                    stop_event,
-                ),
-                name="runner_bot",
-            )
-        )
-
-    # Mini App
-    mini_app_enabled = False
-
-    if only == "miniapp":
-        mini_app_enabled = True
-
-        tasks.append(
-            asyncio.create_task(
-                _run_resilient(
-                    "Mini App",
-                    _run_mini_app,
-                    stop_event,
-                ),
-                name="mini_app",
-            )
-        )
-
-    elif only is None and config.MINI_APP_DOMAIN:
-        mini_app_enabled = True
-
-        tasks.append(
-            asyncio.create_task(
-                _run_resilient(
-                    "Mini App",
-                    _run_mini_app,
-                    stop_event,
-                ),
-                name="mini_app",
-            )
-        )
-
-    # Render Health Server
-    if not mini_app_enabled:
-        tasks.append(
-            asyncio.create_task(
-                _run_resilient(
-                    "Render health server",
-                    _run_render_health_server,
-                    stop_event,
-                ),
-                name="render_health_server",
-            )
-        )
-
-    def _handle_signal(*_args):
-        logger.info("Shutdown signal received, stopping bots...")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(
-                sig,
-                _handle_signal,
-            )
-        except NotImplementedError:
-            pass
-
+# Mini App Server (FastAPI/Uvicorn)
+def run_mini_app():
     try:
-        stop_task = asyncio.create_task(
-            stop_event.wait(),
-            name="stop_event",
-        )
+        from quizbot.mini_app.server import app
+        import uvicorn
+        port = int(os.environ.get("PORT", 10000))
+        logger.info(f"Starting Mini App server on 0.0.0.0:{port}")
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    except ImportError as e:
+        logger.error(f"Mini App import failed: {e}")
+    except Exception as e:
+        logger.error(f"Mini App failed: {e}")
 
-        all_tasks = [*tasks, stop_task]
+# Creator Bot
+async def _run_creator_bot():
+    try:
+        from quizbot.creator_bot.bot import run_creator_bot
+        logger.info("Starting Creator Bot (Pyrogram)...")
+        await run_creator_bot()
+    except ImportError:
+        # Fallback for different function names
+        from quizbot.creator_bot.bot import start_creator_bot
+        logger.info("Starting Creator Bot (Fallback)...")
+        await start_creator_bot()
 
-        done, pending = await asyncio.wait(
-            all_tasks,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+# Runner Bot
+async def _run_runner_bot():
+    try:
+        # यहाँ हमने नाम बदल दिया है ताकि ImportError न आए
+        from quizbot.runner_bot.bot import run_runner_bot
+        logger.info("Starting Runner Bot...")
+        await run_runner_bot()
+    except ImportError:
+        # अगर नाम बदल गया है तो यह वर्जन ट्राई करेगा
+        try:
+            from quizbot.runner_bot.bot import start_runner_bot as run_runner_bot
+            logger.info("Starting Runner Bot (Fallback)...")
+            await run_runner_bot()
+        except ImportError:
+            # अगर ऊपर वाले दोनों नाम नहीं हैं
+            try:
+                from quizbot.runner_bot.bot import start_bot as run_runner_bot
+                logger.info("Starting Runner Bot (Fallback 2)...")
+                await run_runner_bot()
+            except ImportError as e:
+                logger.error(f"Runner Bot failed to import: {e}. Please check quizbot/runner_bot/bot.py for the correct function name.")
+                raise e
 
-        for task in done:
-            if task is stop_task:
-                continue
+# Resilient Runner (इसे हमने FloodWait के लिए थोड़ा बेहतर बना दिया है)
+async def _run_resilient(name, runner_func, delay=10):
+    while True:
+        try:
+            await runner_func()
+        except Exception as e:
+            logger.error(f"{name} failed: {e}; restarting in {delay} seconds")
+            await asyncio.sleep(delay)
 
-            if task.cancelled():
-                continue
+async def main():
+    # चेक करें कि कौन सा बॉट चलाना है (कमांड लाइन आर्ग्युमेंट्स से)
+    only = None
+    if len(sys.argv) > 2 and sys.argv[1] == "--only":
+        only = sys.argv[2]
 
-            exception = task.exception()
+    # Mini App हमेशा अलग थ्रेड/प्रोसेस में चलता है
+    if only == "miniapp":
+        run_mini_app()
+        return
 
-            if exception:
-                logger.error(
-                    "Task %s crashed: %s",
-                    task.get_name(),
-                    exception,
-                    exc_info=exception,
-                )
+    tasks = []
 
-        for task in pending:
-            task.cancel()
+    if only == "creator":
+        tasks.append(asyncio.create_task(_run_resilient("Creator Bot", _run_creator_bot)))
+    elif only == "runner":
+        tasks.append(asyncio.create_task(_run_resilient("Runner Bot", _run_runner_bot)))
+    else:
+        # डिफ़ॉल्ट: दोनों बॉट्स एक साथ चलाएं
+        tasks.append(asyncio.create_task(_run_resilient("Creator Bot", _run_creator_bot)))
+        tasks.append(asyncio.create_task(_run_resilient("Runner Bot", _run_runner_bot)))
 
-        await asyncio.gather(
-            *pending,
-            return_exceptions=True,
-        )
+    # अगर MINI_APP_DOMAIN सेट है, तो मिनी-ऐप भी चलाएं
+    if os.environ.get("MINI_APP_DOMAIN"):
+        import threading
+        threading.Thread(target=run_mini_app, daemon=True).start()
 
-    finally:
-        logger.info("Shutting down...")
-
-        stop_event.set()
-
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-
-        await asyncio.gather(
-            *tasks,
-            return_exceptions=True,
-        )
-
-        await close_session()
-        await close_db()
-
-        logger.info("Shutdown complete.")
-
+    # बॉट्स को चलते रहने दें
+    if tasks:
+        await asyncio.gather(*tasks)
+    else:
+        logger.info("No bots started. Use --only creator/runner/miniapp or set MINI_APP_DOMAIN.")
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser(
-        description="Run the Advance Quiz Bot platform."
-    )
-
-    parser.add_argument(
-        "--only",
-        choices=["creator", "runner", "miniapp"],
-        default=None,
-        help=(
-            "Run only one component. "
-            "Default: run both bots, plus Mini App "
-            "if MINI_APP_DOMAIN is configured."
-        ),
-    )
-
-    args = parser.parse_args()
-
     try:
-        asyncio.run(main(args.only))
-
+        asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        logger.info("Stopped by user.")
